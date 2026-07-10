@@ -5,6 +5,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { createHash, randomUUID } from 'crypto';
 import { db } from '@/lib/db';
 import { CTX_ROOT, getAgentsForOrg, getAllAgents, getOrgs } from '@/lib/config';
 import type { CostEntry } from '@/lib/types';
@@ -203,34 +204,48 @@ interface CodexTokenEntry {
   turn_id?: string;
 }
 
-/**
- * Parse a single codex-tokens.jsonl file. Schema differs from claude JSONL:
- * one record per `thread/tokenUsage/updated` notification with the shape
- * written by CodexAppServerPTY.appendCodexTokenLog.
- */
-function parseCodexJsonlFile(filePath: string, agent: string, org: string): CostEntry[] {
-  const entries: CostEntry[] = [];
-  const previousBySession = new Map<string, {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
-  }>();
-  let content: string;
-  try {
-    content = fs.readFileSync(filePath, 'utf-8');
-  } catch {
-    return [];
-  }
+interface CodexCounters {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
 
-  const lines = content.split('\n').filter((l) => l.trim());
+interface CodexCheckpoint {
+  parser_version: number;
+  file_identity: string;
+  byte_offset: number;
+  boundary_fingerprint: string;
+  file_mtime_ms: number;
+  agent: string;
+  org: string;
+}
+
+interface ParsedCodexLines {
+  entries: CostEntry[];
+  sessionState: Map<string, CodexCounters>;
+}
+
+export const CODEX_COST_PARSER_VERSION = 1;
+
+function parseCodexLines(
+  lines: string[],
+  filePath: string,
+  agent: string,
+  org: string,
+  previousBySession: Map<string, CodexCounters> = new Map(),
+  loadPrevious?: (sessionId: string) => CodexCounters | undefined,
+): ParsedCodexLines {
+  const entries: CostEntry[] = [];
+
   for (const line of lines) {
+    if (!line.trim()) continue;
     try {
       const raw = JSON.parse(line) as CodexTokenEntry;
       const model = raw.model;
       if (!model) continue;
 
-      const cumulative = {
+      const cumulative: CodexCounters = {
         inputTokens: raw.input_tokens ?? 0,
         outputTokens: raw.output_tokens ?? 0,
         cacheReadTokens: raw.cache_read_tokens ?? 0,
@@ -239,13 +254,12 @@ function parseCodexJsonlFile(filePath: string, agent: string, org: string): Cost
       let { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = cumulative;
       let isCumulativeDelta = false;
 
-      // Codex's tokenUsage.total counters are cumulative for the lifetime of a
-      // thread. Logs preserve those totals on every turn, so price only the
-      // increase since the previous row for the same session. A decrease in
-      // any counter means Codex reset its totals; treat that row as the new
-      // baseline. Legacy rows without a session_id remain independent.
       if (raw.session_id) {
-        const previous = previousBySession.get(raw.session_id);
+        let previous = previousBySession.get(raw.session_id);
+        if (!previous && loadPrevious) {
+          previous = loadPrevious(raw.session_id);
+          if (previous) previousBySession.set(raw.session_id, previous);
+        }
         if (previous &&
             cumulative.inputTokens >= previous.inputTokens &&
             cumulative.outputTokens >= previous.outputTokens &&
@@ -260,33 +274,45 @@ function parseCodexJsonlFile(filePath: string, agent: string, org: string): Cost
         previousBySession.set(raw.session_id, cumulative);
       }
 
-      // Keep a zero-delta cumulative snapshot so an upsert can replace an
-      // inflated row imported by an older parser at the same identity.
+      // Keep a zero-delta cumulative snapshot so an upsert can repair a row
+      // imported by an older parser at the same identity.
       if (!isCumulativeDelta &&
           inputTokens === 0 && outputTokens === 0 &&
           cacheReadTokens === 0 && cacheWriteTokens === 0) continue;
 
       const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
-      const costUsd = calculateCost(model, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens);
-      const timestamp = raw.timestamp ?? new Date().toISOString();
-
       entries.push({
-        timestamp,
+        timestamp: raw.timestamp ?? new Date().toISOString(),
         agent,
         org,
         model,
         input_tokens: inputTokens,
         output_tokens: outputTokens,
         total_tokens: totalTokens,
-        cost_usd: costUsd,
+        cost_usd: calculateCost(model, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens),
         source_file: filePath,
       });
     } catch {
-      // Skip malformed lines
+      // Skip malformed complete lines without blocking later records.
     }
   }
 
-  return entries;
+  return { entries, sessionState: previousBySession };
+}
+
+/**
+ * Parse a single codex-tokens.jsonl file. Schema differs from claude JSONL:
+ * one record per `thread/tokenUsage/updated` notification with the shape
+ * written by CodexAppServerPTY.appendCodexTokenLog.
+ */
+function parseCodexJsonlFile(filePath: string, agent: string, org: string): CostEntry[] {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return [];
+  }
+  return parseCodexLines(content.split('\n'), filePath, agent, org).entries;
 }
 
 /**
@@ -341,29 +367,330 @@ const INSERT_COST = db.prepare(`
  * update the existing identity so parser fixes also repair historical data.
  */
 export function persistCostEntries(entries: CostEntry[]): number {
+  return db.transaction((items: CostEntry[]) => persistCostEntryItems(items))(entries);
+}
+
+function persistCostEntryItems(entries: CostEntry[]): number {
   let changed = 0;
-  const insertMany = db.transaction((items: CostEntry[]) => {
-    for (const e of items) {
-      const result = INSERT_COST.run(
-        e.timestamp,
-        e.agent,
-        e.org,
-        e.model,
-        e.input_tokens,
-        e.output_tokens,
-        e.total_tokens,
-        e.cost_usd,
-        e.source_file ?? null,
-      );
-      if (result.changes > 0) changed++;
-    }
-  });
-  insertMany(entries);
+  for (const e of entries) {
+    const result = INSERT_COST.run(
+      e.timestamp,
+      e.agent,
+      e.org,
+      e.model,
+      e.input_tokens,
+      e.output_tokens,
+      e.total_tokens,
+      e.cost_usd,
+      e.source_file ?? null,
+    );
+    if (result.changes > 0) changed++;
+  }
   return changed;
 }
 
+const GET_CODEX_CHECKPOINT = db.prepare(`
+  SELECT parser_version, file_identity, byte_offset, boundary_fingerprint, file_mtime_ms, agent, org
+  FROM codex_cost_checkpoints
+  WHERE file_path = ?
+`);
+
+const UPSERT_CODEX_CHECKPOINT = db.prepare(`
+  INSERT INTO codex_cost_checkpoints
+    (file_path, parser_version, file_identity, byte_offset, boundary_fingerprint, file_mtime_ms, agent, org, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  ON CONFLICT(file_path) DO UPDATE SET
+    parser_version = excluded.parser_version,
+    file_identity = excluded.file_identity,
+    byte_offset = excluded.byte_offset,
+    boundary_fingerprint = excluded.boundary_fingerprint,
+    file_mtime_ms = excluded.file_mtime_ms,
+    agent = excluded.agent,
+    org = excluded.org,
+    updated_at = excluded.updated_at
+`);
+
+const GET_CODEX_SESSION_STATE = db.prepare(`
+  SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+  FROM codex_cost_session_state
+  WHERE file_path = ? AND session_id = ?
+`);
+
+const UPSERT_CODEX_SESSION_STATE = db.prepare(`
+  INSERT INTO codex_cost_session_state
+    (file_path, session_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, revision)
+  VALUES (?, ?, ?, ?, ?, ?, 1)
+  ON CONFLICT(file_path, session_id) DO UPDATE SET
+    input_tokens = excluded.input_tokens,
+    output_tokens = excluded.output_tokens,
+    cache_read_tokens = excluded.cache_read_tokens,
+    cache_write_tokens = excluded.cache_write_tokens,
+    revision = codex_cost_session_state.revision + 1
+`);
+
+function loadCodexSessionState(filePath: string, sessionId: string): CodexCounters | undefined {
+  const row = GET_CODEX_SESSION_STATE.get(filePath, sessionId) as {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_write_tokens: number;
+  } | undefined;
+  if (!row) return undefined;
+  return {
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    cacheReadTokens: row.cache_read_tokens,
+    cacheWriteTokens: row.cache_write_tokens,
+  };
+}
+
+function costIdentity(entry: Pick<CostEntry, 'timestamp' | 'model' | 'agent'>): string {
+  return JSON.stringify([entry.timestamp, entry.model, entry.agent]);
+}
+
+const CHECKPOINT_BOUNDARY_BYTES = 64;
+
+function fingerprintAtOffset(fd: number, byteOffset: number): string | null {
+  if (byteOffset === 0) return '';
+  const length = Math.min(byteOffset, CHECKPOINT_BOUNDARY_BYTES);
+  const buffer = Buffer.allocUnsafe(length);
+  const bytesRead = fs.readSync(fd, buffer, 0, length, byteOffset - length);
+  if (bytesRead !== length) return null;
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+function persistCodexCheckpointBatch(
+  leaseHolder: string,
+  filePath: string,
+  agent: string,
+  org: string,
+  fileIdentity: string,
+  byteOffset: number,
+  boundaryFingerprint: string,
+  fileMtimeMs: number,
+  sessionState: Map<string, CodexCounters>,
+  entries: CostEntry[],
+  rebuild: boolean,
+): number {
+  const writeBatch = db.transaction(() => {
+    assertCostSyncLease(leaseHolder);
+    const changed = persistCostEntryItems(entries);
+
+    if (rebuild) {
+      const desired = new Set(entries.map(costIdentity));
+      const existing = db.prepare(`
+        SELECT id, timestamp, model, agent
+        FROM cost_entries
+        WHERE source_file = ?
+      `).all(filePath) as Array<{ id: number; timestamp: string; model: string; agent: string }>;
+      const deleteRow = db.prepare('DELETE FROM cost_entries WHERE id = ?');
+      for (const row of existing) {
+        if (!desired.has(costIdentity(row))) deleteRow.run(row.id);
+      }
+    }
+
+    UPSERT_CODEX_CHECKPOINT.run(
+      filePath,
+      CODEX_COST_PARSER_VERSION,
+      fileIdentity,
+      byteOffset,
+      boundaryFingerprint,
+      fileMtimeMs,
+      agent,
+      org,
+    );
+
+    if (rebuild) {
+      db.prepare('DELETE FROM codex_cost_session_state WHERE file_path = ?').run(filePath);
+    }
+    for (const [sessionId, counters] of sessionState) {
+      UPSERT_CODEX_SESSION_STATE.run(
+        filePath,
+        sessionId,
+        counters.inputTokens,
+        counters.outputTokens,
+        counters.cacheReadTokens,
+        counters.cacheWriteTokens,
+      );
+    }
+    return changed;
+  });
+
+  return writeBatch.immediate();
+}
+
+function syncCodexFileCosts(
+  leaseHolder: string,
+  filePath: string,
+  agent: string,
+  org: string,
+): { scanned: number; changed: number } {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch {
+    return { scanned: 0, changed: 0 };
+  }
+
+  try {
+    const stat = fs.fstatSync(fd);
+    const fileIdentity = `${stat.dev}:${stat.ino}`;
+    const checkpoint = GET_CODEX_CHECKPOINT.get(filePath) as CodexCheckpoint | undefined;
+    const checkpointOffsetValid = Boolean(
+      checkpoint && checkpoint.byte_offset >= 0 && checkpoint.byte_offset <= stat.size,
+    );
+    let rebuild = !checkpoint ||
+      checkpoint.parser_version !== CODEX_COST_PARSER_VERSION ||
+      checkpoint.file_identity !== fileIdentity ||
+      checkpoint.agent !== agent ||
+      checkpoint.org !== org ||
+      !checkpointOffsetValid;
+
+    // An unchanged, fully consumed file is a zero-I/O steady-state no-op.
+    if (!rebuild && checkpoint!.byte_offset === stat.size) {
+      if (checkpoint!.file_mtime_ms === stat.mtimeMs) return { scanned: 0, changed: 0 };
+      // Same size with a new mtime cannot be an append; rebuild even when the
+      // writer preserved the old boundary bytes.
+      rebuild = true;
+    }
+
+    if (!rebuild) {
+      // The managed writer only uses appendFileSync. For bounded steady-state
+      // work, validate the immutable checkpoint boundary instead of rereading
+      // the historical prefix. An out-of-contract same-inode rewrite that
+      // preserves this boundary and then grows beyond the old offset cannot be
+      // distinguished from an append on filesystems without a generation id;
+      // managed rotations must replace the inode rather than truncate in place.
+      const currentBoundary = fingerprintAtOffset(fd, checkpoint!.byte_offset);
+      if (currentBoundary === null || checkpoint!.boundary_fingerprint !== currentBoundary) {
+        rebuild = true;
+      }
+    }
+
+    const byteOffset = rebuild ? 0 : checkpoint!.byte_offset;
+    const bytesToRead = stat.size - byteOffset;
+
+    if (bytesToRead === 0 && !rebuild) return { scanned: 0, changed: 0 };
+
+    const buffer = Buffer.allocUnsafe(bytesToRead);
+    let bytesRead = 0;
+    while (bytesRead < bytesToRead) {
+      const count = fs.readSync(fd, buffer, bytesRead, bytesToRead - bytesRead, byteOffset + bytesRead);
+      if (count === 0) break;
+      bytesRead += count;
+    }
+
+    // An in-place truncation raced the read. Do not advance the checkpoint;
+    // the next refresh will reopen the file and rebuild from its stable size.
+    if (bytesRead !== bytesToRead || fs.fstatSync(fd).size < stat.size) {
+      return { scanned: 0, changed: 0 };
+    }
+
+    const completeLineEnd = buffer.lastIndexOf(0x0a);
+    if (completeLineEnd < 0 && !rebuild) return { scanned: 0, changed: 0 };
+
+    const completeBytes = completeLineEnd < 0 ? 0 : completeLineEnd + 1;
+    const content = buffer.subarray(0, completeBytes).toString('utf-8');
+    const parsed = parseCodexLines(
+      content.split('\n'),
+      filePath,
+      agent,
+      org,
+      new Map(),
+      rebuild ? undefined : (sessionId) => loadCodexSessionState(filePath, sessionId),
+    );
+    const nextByteOffset = byteOffset + completeBytes;
+    const nextBoundaryFingerprint = fingerprintAtOffset(fd, nextByteOffset);
+    if (nextBoundaryFingerprint === null) return { scanned: 0, changed: 0 };
+    const changed = persistCodexCheckpointBatch(
+      leaseHolder,
+      filePath,
+      agent,
+      org,
+      fileIdentity,
+      nextByteOffset,
+      nextBoundaryFingerprint,
+      stat.mtimeMs,
+      parsed.sessionState,
+      parsed.entries,
+      rebuild,
+    );
+    return { scanned: parsed.entries.length, changed };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function syncCodexLogsCostsIncremental(leaseHolder: string): { scanned: number; changed: number } {
+  const pairs: Array<{ name: string; org: string }> = getAllAgents();
+  if (pairs.length === 0) {
+    for (const org of getOrgs()) {
+      for (const name of getAgentsForOrg(org)) pairs.push({ name, org });
+    }
+  }
+
+  let scanned = 0;
+  let changed = 0;
+  const visited = new Set<string>();
+  for (const { name, org } of pairs) {
+    const filePath = path.join(CTX_ROOT, 'logs', name, 'codex-tokens.jsonl');
+    if (visited.has(filePath)) continue;
+    visited.add(filePath);
+    const result = syncCodexFileCosts(leaseHolder, filePath, name, org);
+    scanned += result.scanned;
+    changed += result.changed;
+  }
+  return { scanned, changed };
+}
+
+const COST_SYNC_LEASE_NAME = 'cost-sync';
+const COST_SYNC_LEASE_MS = 10 * 60 * 1000;
+
+class CostSyncLeaseLostError extends Error {
+  constructor() {
+    super('Cost sync writer lease was lost or expired before persistence');
+    this.name = 'CostSyncLeaseLostError';
+  }
+}
+
+function assertCostSyncLease(holder: string): void {
+  const lease = db.prepare(`
+    SELECT 1
+    FROM cost_sync_leases
+    WHERE name = ? AND holder = ? AND expires_at > ?
+  `).get(COST_SYNC_LEASE_NAME, holder, Date.now());
+  if (!lease) throw new CostSyncLeaseLostError();
+}
+
+function acquireCostSyncLease(holder: string): boolean {
+  const now = Date.now();
+  const result = db.prepare(`
+    INSERT INTO cost_sync_leases (name, holder, expires_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      holder = excluded.holder,
+      expires_at = excluded.expires_at
+    WHERE cost_sync_leases.expires_at <= ?
+  `).run(COST_SYNC_LEASE_NAME, holder, now + COST_SYNC_LEASE_MS, now);
+  return result.changes === 1;
+}
+
+function releaseCostSyncLease(holder: string): void {
+  db.prepare('DELETE FROM cost_sync_leases WHERE name = ? AND holder = ?')
+    .run(COST_SYNC_LEASE_NAME, holder);
+}
+
+function persistCostEntriesWithLease(entries: CostEntry[], holder: string): number {
+  const write = db.transaction(() => {
+    assertCostSyncLease(holder);
+    return persistCostEntryItems(entries);
+  });
+  return write.immediate();
+}
+
 /**
- * Full sync: scan claude JSONL + codex JSONL files and persist to DB.
+ * Scan cost sources and persist changes. Claude sources retain their existing
+ * full-scan behavior; Codex sources resume from durable byte checkpoints.
  *
  * Dedup contract: an (agent, model, source_file, timestamp) tuple from claude
  * scan and codex scan should never collide in practice, because codex turns are
@@ -372,21 +699,39 @@ export function persistCostEntries(entries: CostEntry[]): number {
  * union explicitly so any future overlap (e.g., a codex agent that also gets
  * scanned through claude's projects dir) does not double-count.
  */
-export function syncCosts(): { scanned: number; changed: number } {
-  const claudeEntries = scanClaudeProjectsCosts();
-  const codexEntries = scanCodexLogsCosts();
+export interface CostSyncResult {
+  scanned: number;
+  changed: number;
+  completed: boolean;
+}
 
-  const seen = new Set<string>();
-  const merged: CostEntry[] = [];
-  for (const entry of [...claudeEntries, ...codexEntries]) {
-    const key = `${entry.source_file ?? ''}|${entry.timestamp}|${entry.model}|${entry.agent}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(entry);
+export function syncCosts(): CostSyncResult {
+  const holder = `${process.pid}:${randomUUID()}`;
+  if (!acquireCostSyncLease(holder)) return { scanned: 0, changed: 0, completed: false };
+
+  try {
+    const claudeEntries = scanClaudeProjectsCosts();
+    const seen = new Set<string>();
+    const uniqueClaudeEntries: CostEntry[] = [];
+    for (const entry of claudeEntries) {
+      const key = `${entry.source_file ?? ''}|${entry.timestamp}|${entry.model}|${entry.agent}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueClaudeEntries.push(entry);
+    }
+
+    const claudeChanged = uniqueClaudeEntries.length > 0
+      ? persistCostEntriesWithLease(uniqueClaudeEntries, holder)
+      : 0;
+    const codexResult = syncCodexLogsCostsIncremental(holder);
+    return {
+      scanned: uniqueClaudeEntries.length + codexResult.scanned,
+      changed: claudeChanged + codexResult.changed,
+      completed: true,
+    };
+  } finally {
+    releaseCostSyncLease(holder);
   }
-
-  const changed = merged.length > 0 ? persistCostEntries(merged) : 0;
-  return { scanned: merged.length, changed };
 }
 
 // ---------------------------------------------------------------------------

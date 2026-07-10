@@ -4,6 +4,7 @@
 import fs from 'fs';
 import path from 'path';
 import { db } from './db';
+import { syncCosts } from './cost-parser';
 import {
   CTX_ROOT,
   getOrgs,
@@ -331,25 +332,25 @@ export function syncAll(): SyncResult {
 }
 
 // ---------------------------------------------------------------------------
-// Lazy cost sync (only called from Analytics page)
+// On-visit cost sync (only called from Analytics page)
 // ---------------------------------------------------------------------------
 
 const COST_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 export function syncCostsLazy(): void {
   const now = Date.now();
-  const lastCostSync = (globalThis as unknown as Record<string, number>).__lastCostSync ?? 0;
-  if (now - lastCostSync > COST_SYNC_INTERVAL_MS) {
-    try {
-      const { syncCosts } = require('./cost-parser');
-      const costResult = syncCosts();
-      (globalThis as unknown as Record<string, number>).__lastCostSync = now;
-      if (costResult.changed > 0) {
-        console.log(`[sync] Cost sync: ${costResult.scanned} scanned, ${costResult.changed} changed`);
-      }
-    } catch (error) {
-      console.warn('[sync] Cost sync failed; analytics may be stale:', error);
+  const globals = globalThis as unknown as { __lastCostSync?: number };
+  if (now - (globals.__lastCostSync ?? 0) <= COST_SYNC_INTERVAL_MS) return;
+
+  try {
+    const costResult = syncCosts();
+    if (!costResult.completed) return;
+    globals.__lastCostSync = now;
+    if (costResult.changed > 0) {
+      console.log(`[sync] Cost sync: ${costResult.scanned} scanned, ${costResult.changed} changed`);
     }
+  } catch (error) {
+    console.warn('[sync] Cost sync failed; analytics may be stale:', error);
   }
 }
 
