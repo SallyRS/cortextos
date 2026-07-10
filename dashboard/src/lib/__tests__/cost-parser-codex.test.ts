@@ -15,7 +15,7 @@
  *   - source_file always points at codex-tokens.jsonl (dedup key invariant)
  */
 
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -56,6 +56,7 @@ let calculateCost: typeof import('../cost-parser')['calculateCost'];
 let scanCodexLogsCosts: typeof import('../cost-parser')['scanCodexLogsCosts'];
 let persistCostEntries: typeof import('../cost-parser')['persistCostEntries'];
 let syncCosts: typeof import('../cost-parser')['syncCosts'];
+let syncCostsLazy: typeof import('../sync')['syncCostsLazy'];
 let db: typeof import('../db')['db'];
 let migratedLegacyCount: number;
 let migratedLegacyTokens: number;
@@ -66,6 +67,7 @@ beforeAll(async () => {
   scanCodexLogsCosts = mod.scanCodexLogsCosts;
   persistCostEntries = mod.persistCostEntries;
   syncCosts = mod.syncCosts;
+  ({ syncCostsLazy } = await import('../sync'));
   ({ db } = await import('../db'));
   migratedLegacyCount = (
     db.prepare("SELECT COUNT(*) AS count FROM cost_entries WHERE agent = 'legacy-agent'").get() as { count: number }
@@ -94,6 +96,18 @@ beforeEach(() => {
   const logsDir = path.join(tmpDir, 'logs');
   if (fs.existsSync(logsDir)) fs.rmSync(logsDir, { recursive: true, force: true });
   db.prepare('DELETE FROM cost_entries').run();
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'codex_cost_session_state'").get()) {
+    db.prepare('DELETE FROM codex_cost_session_state').run();
+  }
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'codex_cost_checkpoints'").get()) {
+    db.prepare('DELETE FROM codex_cost_checkpoints').run();
+  }
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cost_sync_leases'").get()) {
+    db.prepare('DELETE FROM cost_sync_leases').run();
+  }
+  const globals = globalThis as unknown as Record<string, unknown>;
+  delete globals.__lastCostSync;
+  delete globals.__costSyncScheduled;
 });
 
 function writeCodexLog(agent: string, lines: Array<Record<string, unknown>>): string {
@@ -102,6 +116,11 @@ function writeCodexLog(agent: string, lines: Array<Record<string, unknown>>): st
   const filePath = path.join(dir, 'codex-tokens.jsonl');
   fs.writeFileSync(filePath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
   return filePath;
+}
+
+function appendCodexLog(filePath: string, lines: Array<Record<string, unknown>>, trailingNewline = true): void {
+  const content = lines.map((line) => JSON.stringify(line)).join('\n');
+  fs.appendFileSync(filePath, content + (trailingNewline ? '\n' : ''));
 }
 
 describe('codex pricing — gpt-5-codex pricing key resolution', () => {
@@ -399,7 +418,7 @@ describe('codex cost persistence', () => {
     });
   });
 
-  it('repairs inflated rows through a full sync and stays idempotent', () => {
+  it('repairs inflated rows through an initial backfill and checkpoints the file', () => {
     const sourceFile = writeCodexLog('codex-alpha', [
       { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
       { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 250, output_tokens: 90, session_id: 'thread-A' },
@@ -417,8 +436,8 @@ describe('codex cost persistence', () => {
       },
     ]);
 
-    expect(syncCosts()).toEqual({ scanned: 2, changed: 1 });
-    expect(syncCosts()).toEqual({ scanned: 2, changed: 0 });
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 1, completed: true });
+    expect(syncCosts()).toMatchObject({ scanned: 0, changed: 0 });
     expect(
       db.prepare(
         'SELECT COUNT(*) AS count, SUM(input_tokens) AS input, SUM(output_tokens) AS output FROM cost_entries',
@@ -450,12 +469,321 @@ describe('codex cost persistence', () => {
       },
     ]);
 
-    expect(syncCosts()).toEqual({ scanned: 3, changed: 2 });
-    expect(syncCosts()).toEqual({ scanned: 3, changed: 0 });
+    expect(syncCosts()).toMatchObject({ scanned: 3, changed: 2 });
+    expect(syncCosts()).toMatchObject({ scanned: 0, changed: 0 });
     expect(
       db.prepare(
         'SELECT COUNT(*) AS count, SUM(input_tokens) AS input, SUM(output_tokens) AS output FROM cost_entries',
       ).get(),
     ).toEqual({ count: 3, input: 160, output: 80 });
+  });
+});
+
+describe('incremental codex cost sync', () => {
+  it('reads only appended bytes and carries cumulative session baselines forward', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 250, output_tokens: 90, session_id: 'thread-A' },
+    ]);
+
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 2 });
+    appendCodexLog(filePath, [
+      { timestamp: '2026-05-08T01:02:00Z', model: 'gpt-5-codex', input_tokens: 400, output_tokens: 120, session_id: 'thread-A' },
+    ]);
+
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+    expect(
+      db.prepare('SELECT COUNT(*) AS count, SUM(input_tokens) AS input, SUM(output_tokens) AS output FROM cost_entries').get(),
+    ).toEqual({ count: 3, input: 400, output: 120 });
+    expect(
+      db.prepare('SELECT byte_offset FROM codex_cost_checkpoints WHERE file_path = ?').get(filePath),
+    ).toEqual({ byte_offset: fs.statSync(filePath).size });
+  });
+
+  it('does not reread the historical prefix when importing an append', () => {
+    const historical = Array.from({ length: 500 }, (_, index) => ({
+      timestamp: `2026-05-08T01:${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}Z`,
+      model: 'gpt-5-codex',
+      input_tokens: index + 1,
+      output_tokens: index + 1,
+      session_id: 'long-running-thread',
+    }));
+    const filePath = writeCodexLog('codex-alpha', historical);
+    expect(syncCosts()).toMatchObject({ scanned: 500, changed: 500 });
+    const historicalBytes = fs.statSync(filePath).size;
+
+    const appended = {
+      timestamp: '2026-05-08T10:00:00Z', model: 'gpt-5-codex', input_tokens: 501,
+      output_tokens: 501, session_id: 'long-running-thread',
+    };
+    appendCodexLog(filePath, [appended]);
+    const appendedBytes = fs.statSync(filePath).size - historicalBytes;
+    const readSpy = vi.spyOn(fs, 'readSync');
+    try {
+      expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+      const readCalls = readSpy.mock.calls as unknown as Array<
+        [number, NodeJS.ArrayBufferView, number, number, number | null]
+      >;
+      const requestedBytes = readCalls.reduce(
+        (total, call) => total + (typeof call[3] === 'number' ? call[3] : 0),
+        0,
+      );
+      expect(requestedBytes).toBeLessThanOrEqual(appendedBytes + 2 * 64);
+      expect(requestedBytes).toBeLessThan(historicalBytes / 10);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it('tracks interleaved sessions independently across append boundaries', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 300, output_tokens: 80, session_id: 'thread-B' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 2 });
+
+    appendCodexLog(filePath, [
+      { timestamp: '2026-05-08T01:02:00Z', model: 'gpt-5-codex', input_tokens: 160, output_tokens: 70, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:03:00Z', model: 'gpt-5-codex', input_tokens: 350, output_tokens: 100, session_id: 'thread-B' },
+    ]);
+
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 2 });
+    expect(
+      db.prepare('SELECT input_tokens, output_tokens FROM cost_entries ORDER BY timestamp').all(),
+    ).toEqual([
+      { input_tokens: 100, output_tokens: 50 },
+      { input_tokens: 300, output_tokens: 80 },
+      { input_tokens: 60, output_tokens: 20 },
+      { input_tokens: 50, output_tokens: 20 },
+    ]);
+  });
+
+  it('updates baseline rows only for sessions touched by an append', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 300, output_tokens: 80, session_id: 'thread-B' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 2 });
+
+    appendCodexLog(filePath, [
+      { timestamp: '2026-05-08T01:02:00Z', model: 'gpt-5-codex', input_tokens: 160, output_tokens: 70, session_id: 'thread-A' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+
+    expect(
+      db.prepare(`
+        SELECT session_id, revision
+        FROM codex_cost_session_state
+        WHERE file_path = ?
+        ORDER BY session_id
+      `).all(filePath),
+    ).toEqual([
+      { session_id: 'thread-A', revision: 2 },
+      { session_id: 'thread-B', revision: 1 },
+    ]);
+  });
+
+  it('leaves an unterminated line uncheckpointed until the writer completes it', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+
+    const next = { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 175, output_tokens: 80, session_id: 'thread-A' };
+    appendCodexLog(filePath, [next], false);
+    expect(syncCosts()).toMatchObject({ scanned: 0, changed: 0 });
+
+    fs.appendFileSync(filePath, '\n');
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+    expect(
+      db.prepare('SELECT SUM(input_tokens) AS input, SUM(output_tokens) AS output FROM cost_entries').get(),
+    ).toEqual({ input: 175, output: 80 });
+  });
+
+  it('rebuilds a source after in-place truncation and removes stale rows', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'old-thread' },
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 250, output_tokens: 90, session_id: 'old-thread' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 2 });
+
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      timestamp: '2026-05-09T01:00:00Z', model: 'gpt-5-codex', input_tokens: 40, output_tokens: 10, session_id: 'new-thread',
+    })}\n`);
+
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+    expect(db.prepare('SELECT timestamp, input_tokens FROM cost_entries').all()).toEqual([
+      { timestamp: '2026-05-09T01:00:00Z', input_tokens: 40 },
+    ]);
+  });
+
+  it('detects an in-place truncate-and-regrow beyond the previous offset', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'old' },
+    ]);
+    const originalIdentity = fs.statSync(filePath).ino;
+    const originalSize = fs.statSync(filePath).size;
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      timestamp: '2026-05-09T01:00:00Z', model: 'gpt-5-codex', input_tokens: 900, output_tokens: 300,
+      session_id: 'new-thread-whose-record-is-deliberately-longer-than-the-original-checkpoint',
+    })}\n`);
+    expect(fs.statSync(filePath).ino).toBe(originalIdentity);
+    expect(fs.statSync(filePath).size).toBeGreaterThan(originalSize);
+
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+    expect(db.prepare('SELECT timestamp, input_tokens FROM cost_entries').all()).toEqual([
+      { timestamp: '2026-05-09T01:00:00Z', input_tokens: 900 },
+    ]);
+  });
+
+  it('detects a multi-line rewrite that preserves the old checkpoint tail', () => {
+    const original = [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 111, output_tokens: 51, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 222, output_tokens: 82, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:02:00Z', model: 'gpt-5-codex', input_tokens: 333, output_tokens: 93, session_id: 'thread-A' },
+    ];
+    const filePath = writeCodexLog('codex-alpha', original);
+    const oldSize = fs.statSync(filePath).size;
+    const oldTail = fs.readFileSync(filePath).subarray(oldSize - 64, oldSize);
+    expect(syncCosts()).toMatchObject({ scanned: 3, changed: 3 });
+
+    const rewritten = [
+      { ...original[0], input_tokens: 211, output_tokens: 61 },
+      { ...original[1], input_tokens: 322, output_tokens: 92 },
+      original[2],
+    ];
+    fs.writeFileSync(filePath, `${rewritten.map((row) => JSON.stringify(row)).join('\n')}\n`);
+    expect(fs.statSync(filePath).size).toBe(oldSize);
+    expect(fs.readFileSync(filePath).subarray(oldSize - 64, oldSize)).toEqual(oldTail);
+
+    expect(syncCosts()).toMatchObject({ scanned: 3, changed: 2 });
+    expect(
+      db.prepare('SELECT SUM(input_tokens) AS input, SUM(output_tokens) AS output FROM cost_entries').get(),
+    ).toEqual({ input: 333, output: 93 });
+  });
+
+  it('detects an atomically replaced source even when it is not shorter', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'old-thread' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+
+    const replacementPath = `${filePath}.replacement`;
+    fs.writeFileSync(replacementPath, `${JSON.stringify({
+      timestamp: '2026-05-09T01:00:00Z', model: 'gpt-5-codex', input_tokens: 500, output_tokens: 200, session_id: 'new-thread-with-a-longer-identifier',
+    })}\n`);
+    fs.renameSync(replacementPath, filePath);
+
+    expect(syncCosts()).toMatchObject({ scanned: 1, changed: 1 });
+    expect(db.prepare('SELECT timestamp, input_tokens FROM cost_entries').all()).toEqual([
+      { timestamp: '2026-05-09T01:00:00Z', input_tokens: 500 },
+    ]);
+  });
+
+  it('rebuilds historical rows when the parser version changes', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 250, output_tokens: 90, session_id: 'thread-A' },
+    ]);
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 2 });
+    db.prepare('UPDATE codex_cost_checkpoints SET parser_version = 0 WHERE file_path = ?').run(filePath);
+
+    expect(syncCosts()).toMatchObject({ scanned: 2, changed: 0 });
+    expect(
+      db.prepare('SELECT parser_version FROM codex_cost_checkpoints WHERE file_path = ?').get(filePath),
+    ).toEqual({ parser_version: 1 });
+    expect(
+      db.prepare('SELECT COUNT(*) AS count, SUM(input_tokens) AS input, SUM(output_tokens) AS output FROM cost_entries').get(),
+    ).toEqual({ count: 2, input: 250, output: 90 });
+  });
+
+  it('skips work while another process holds the writer lease', () => {
+    writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50 },
+    ]);
+    db.prepare(
+      'INSERT INTO cost_sync_leases (name, holder, expires_at) VALUES (?, ?, ?)',
+    ).run('cost-sync', 'another-process', Date.now() + 60_000);
+
+    expect(syncCosts()).toEqual({ scanned: 0, changed: 0, completed: false });
+    expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 0 });
+  });
+
+  it('rejects a stale writer after a second connection takes over an expired lease', () => {
+    writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50 },
+    ]);
+    const competingDb = new Database(db.name);
+    competingDb.pragma('busy_timeout = 10000');
+    const originalReadSync = fs.readSync.bind(fs);
+    let tookOver = false;
+    const readSpy = vi.spyOn(fs, 'readSync').mockImplementation((...args) => {
+      const result = originalReadSync(...args);
+      if (!tookOver) {
+        tookOver = true;
+        const now = Date.now();
+        competingDb.prepare("UPDATE cost_sync_leases SET expires_at = 0 WHERE name = 'cost-sync'").run();
+        competingDb.prepare(`
+          INSERT INTO cost_sync_leases (name, holder, expires_at)
+          VALUES ('cost-sync', 'replacement-writer', ?)
+          ON CONFLICT(name) DO UPDATE SET
+            holder = excluded.holder,
+            expires_at = excluded.expires_at
+          WHERE cost_sync_leases.expires_at <= ?
+        `).run(now + 60_000, now);
+      }
+      return result;
+    });
+
+    try {
+      expect(() => syncCosts()).toThrow(/lease/i);
+      expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 0 });
+      expect(db.prepare("SELECT holder FROM cost_sync_leases WHERE name = 'cost-sync'").get())
+        .toEqual({ holder: 'replacement-writer' });
+    } finally {
+      readSpy.mockRestore();
+      competingDb.close();
+    }
+  });
+});
+
+describe('analytics cost refresh', () => {
+  it('syncs before the current visit when due and preserves the five-minute throttle', () => {
+    const filePath = writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50, session_id: 'thread-A' },
+    ]);
+
+    syncCostsLazy();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 1 });
+
+    appendCodexLog(filePath, [
+      { timestamp: '2026-05-08T01:01:00Z', model: 'gpt-5-codex', input_tokens: 175, output_tokens: 80, session_id: 'thread-A' },
+    ]);
+    syncCostsLazy();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 1 });
+
+    (globalThis as unknown as { __lastCostSync?: number }).__lastCostSync = 0;
+    syncCostsLazy();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 2 });
+  });
+
+  it('does not throttle the retry when another writer holds the lease', () => {
+    writeCodexLog('codex-alpha', [
+      { timestamp: '2026-05-08T01:00:00Z', model: 'gpt-5-codex', input_tokens: 100, output_tokens: 50 },
+    ]);
+    db.prepare(
+      'INSERT INTO cost_sync_leases (name, holder, expires_at) VALUES (?, ?, ?)',
+    ).run('cost-sync', 'another-process', Date.now() + 60_000);
+
+    syncCostsLazy();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 0 });
+    expect((globalThis as unknown as { __lastCostSync?: number }).__lastCostSync).toBeUndefined();
+
+    db.prepare("DELETE FROM cost_sync_leases WHERE name = 'cost-sync'").run();
+    syncCostsLazy();
+    expect(db.prepare('SELECT COUNT(*) AS count FROM cost_entries').get()).toEqual({ count: 1 });
+    expect((globalThis as unknown as { __lastCostSync?: number }).__lastCostSync).toBeTypeOf('number');
   });
 });

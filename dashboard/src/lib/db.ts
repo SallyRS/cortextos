@@ -141,6 +141,42 @@ function initializeSchema(db: Database.Database): void {
       last_synced TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Incremental Codex cost sync state. file_identity detects atomic
+    -- replacement; byte_offset always points just after a complete JSONL line.
+    CREATE TABLE IF NOT EXISTS codex_cost_checkpoints (
+      file_path TEXT PRIMARY KEY,
+      parser_version INTEGER NOT NULL,
+      file_identity TEXT NOT NULL,
+      byte_offset INTEGER NOT NULL DEFAULT 0,
+      boundary_fingerprint TEXT NOT NULL DEFAULT '',
+      file_mtime_ms REAL NOT NULL DEFAULT 0,
+      agent TEXT NOT NULL,
+      org TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Normalized cumulative baselines keep steady-state checkpoint writes
+    -- proportional to the sessions touched by newly appended records.
+    CREATE TABLE IF NOT EXISTS codex_cost_session_state (
+      file_path TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL,
+      output_tokens INTEGER NOT NULL,
+      cache_read_tokens INTEGER NOT NULL,
+      cache_write_tokens INTEGER NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (file_path, session_id),
+      FOREIGN KEY (file_path) REFERENCES codex_cost_checkpoints(file_path) ON DELETE CASCADE
+    );
+
+    -- Cross-process writer lease for on-visit cost refreshes. Expired rows are
+    -- claimed atomically, so concurrent Next.js workers cannot both sync.
+    CREATE TABLE IF NOT EXISTS cost_sync_leases (
+      name TEXT PRIMARY KEY,
+      holder TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
     -- Rate limit table: persists across server restarts so limits survive hot-reloads
     -- and intentional restarts. reset_at is a Unix timestamp in milliseconds.
     CREATE TABLE IF NOT EXISTS rate_limits (
@@ -174,6 +210,22 @@ function initializeSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_org ON messages(org);
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
   `);
+
+  // Keep checkpoint schema upgrades safe for databases created by an earlier
+  // dashboard build while this feature was rolling out.
+  const migrateCodexCheckpoint = db.transaction(() => {
+    const columns = new Set(
+      (db.pragma('table_info(codex_cost_checkpoints)') as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!columns.has('boundary_fingerprint')) {
+      db.exec("ALTER TABLE codex_cost_checkpoints ADD COLUMN boundary_fingerprint TEXT NOT NULL DEFAULT ''");
+    }
+    if (!columns.has('file_mtime_ms')) {
+      db.exec('ALTER TABLE codex_cost_checkpoints ADD COLUMN file_mtime_ms REAL NOT NULL DEFAULT 0');
+    }
+  });
+  migrateCodexCheckpoint.immediate();
 
   // Older databases did not enforce the identity used by the cost sync, so
   // repeated scans could insert the same JSONL row more than once. Migrate
@@ -264,6 +316,9 @@ export function getTableCounts(): Record<string, number> {
     'users',
     'messages',
     'sync_meta',
+    'codex_cost_checkpoints',
+    'codex_cost_session_state',
+    'cost_sync_leases',
   ];
   const counts: Record<string, number> = {};
   for (const table of tables) {
