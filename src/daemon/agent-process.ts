@@ -15,6 +15,10 @@ import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
 
+export type AgentStartOutcome =
+  | { kind: 'started' | 'already-running' | 'recovery-pending' }
+  | { kind: 'cancelled' | 'configuration-error' | 'runtime-error'; error?: string };
+
 /**
  * Manages a single agent's lifecycle.
  * Replaces agent-wrapper.sh for one agent.
@@ -36,6 +40,10 @@ export class AgentProcess {
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
+  /** Invalidates an in-flight delayed/spawning start when stop() wins the race. */
+  private startAttemptGeneration: number = 0;
+  /** Status evidence for callers that must not claim an unscheduled restart. */
+  private restartScheduled: boolean = false;
   // BUG-040 fix: persists across stop() return until handleExit clears it.
   // Required because BUG-032's CRLF + 5s wait can cause graceful shutdown to
   // exceed the 5s Promise.race timeout in stop(), which would otherwise reset
@@ -88,17 +96,32 @@ export class AgentProcess {
   /**
    * Start the agent. Spawns Claude Code in a PTY.
    */
-  async start(): Promise<void> {
+  async start(): Promise<AgentStartOutcome> {
     if (this.status === 'running') {
       this.log('Already running');
-      return;
+      return { kind: 'already-running' };
     }
+
+    const startAttempt = ++this.startAttemptGeneration;
+    // A new explicit/recovery start supersedes a completed prior stop. A stop
+    // that races this attempt increments startAttemptGeneration and therefore
+    // cannot be cleared after the startup delay.
+    this.stopRequested = false;
+    this.restartScheduled = false;
+    this.status = 'starting';
+    this.notifyStatusChange();
 
     // Apply startup delay
     const delay = this.config.startup_delay || 0;
     if (delay > 0) {
       this.log(`Startup delay: ${delay}s`);
       await sleep(delay * 1000);
+    }
+    if (startAttempt !== this.startAttemptGeneration || this.stopRequested) {
+      this.log('Startup cancelled before runtime configuration');
+      this.status = 'stopped';
+      this.notifyStatusChange();
+      return { kind: 'cancelled' };
     }
 
     // Write .cortextos-env for backward compat (D6)
@@ -113,12 +136,6 @@ export class AgentProcess {
       : this.buildContinuePrompt();
 
     this.log(`Starting in ${mode} mode`);
-    this.status = 'starting';
-
-    // BUG-040 fix: clear any stale stop request from a previous lifecycle
-    // (e.g. if the previous stop() timed out before the PTY actually exited).
-    // We're starting fresh — the new PTY has no pending stop.
-    this.stopRequested = false;
     // BUG-040 fix: bump generation. The onExit closure below captures THIS
     // value and uses it to detect "I'm an old PTY whose exit fired after a
     // new lifecycle began" — in which case it bails out without touching
@@ -129,13 +146,25 @@ export class AgentProcess {
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
     ensureDir(join(this.env.ctxRoot, 'logs', this.name));
     this.log(`Log path: ${logPath}`);
-    this.pty = this.config.runtime === 'hermes'
-      ? new HermesPTY(this.env, this.config, logPath)
-      : this.config.runtime === 'opencode'
-        ? new OpencodePTY(this.env, this.config, logPath)
-        : this.config.runtime === 'codex-app-server'
-          ? new CodexAppServerPTY(this.env, this.config, logPath)
-          : new AgentPTY(this.env, this.config, logPath);
+    try {
+      this.pty = this.config.runtime === 'hermes'
+        ? new HermesPTY(this.env, this.config, logPath)
+        : this.config.runtime === 'opencode'
+          ? new OpencodePTY(this.env, this.config, logPath)
+          : this.config.runtime === 'codex-app-server'
+            ? new CodexAppServerPTY(this.env, this.config, logPath)
+            : new AgentPTY(this.env, this.config, logPath);
+    } catch (err) {
+      const error = String(err);
+      const hint = this.config.runtime === 'codex-app-server'
+        ? ' Review the explicit codex_* capability arrays in config.json before restarting this seat.'
+        : '';
+      this.log(`Failed to configure runtime: ${error}.${hint}`);
+      this.status = 'crashed';
+      this.restartScheduled = false;
+      this.notifyStatusChange();
+      return { kind: 'configuration-error', error };
+    }
 
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
     // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
@@ -167,22 +196,31 @@ export class AgentProcess {
       this.resolveExit?.();
       this.resolveExit = null;
     });
+    const startingPty = this.pty;
 
     try {
-      await this.pty.spawn(mode, prompt);
+      await startingPty.spawn(mode, prompt);
+      if (startAttempt !== this.startAttemptGeneration || this.stopRequested || this.stopping) {
+        this.disposeCancelledStartupPty(startingPty);
+        this.status = 'stopped';
+        this.restartScheduled = false;
+        this.notifyStatusChange();
+        return { kind: 'cancelled' };
+      }
       // Codex exec-per-turn race: the new PTY's onExit can fire BEFORE this
       // line if `codex exec` completes its prompt quickly (CodexAppServerPTY's spawn
       // resolves once exec is launched, but the process may exit moments
       // later as it finishes the bootstrap turn). handleExit() nulls
       // this.pty and schedules crash recovery — we must not claim 'running'
       // or call getPid() on null in that window.
-      if (!this.pty) {
+      if (this.pty !== startingPty) {
         this.log('PTY exited during spawn — handleExit will recover');
-        return;
+        return { kind: 'recovery-pending' };
       }
       this.status = 'running';
+      this.restartScheduled = false;
       this.sessionStart = new Date();
-      this.log(`Running (pid: ${this.pty.getPid()})`);
+      this.log(`Running (pid: ${startingPty.getPid()})`);
 
       this.maybeSendRuntimeLifecycleNotification();
 
@@ -190,10 +228,36 @@ export class AgentProcess {
       this.startSessionTimer();
 
       this.notifyStatusChange();
+      return { kind: 'started' };
     } catch (err) {
+      if (startAttempt !== this.startAttemptGeneration || this.stopRequested || this.stopping) {
+        this.disposeCancelledStartupPty(startingPty);
+        this.status = 'stopped';
+        this.restartScheduled = false;
+        this.notifyStatusChange();
+        return { kind: 'cancelled' };
+      }
+      if (this.restartScheduled) {
+        this.log(`Runtime exited during startup; scheduled recovery remains authoritative: ${err}`);
+        return { kind: 'recovery-pending' };
+      }
       this.log(`Failed to start: ${err}`);
       this.status = 'crashed';
+      this.restartScheduled = false;
       this.notifyStatusChange();
+      return { kind: 'runtime-error', error: String(err) };
+    }
+  }
+
+  private disposeCancelledStartupPty(
+    pty: AgentPTY | CodexAppServerPTY,
+  ): void {
+    if (this.pty === pty) this.pty = null;
+    try {
+      if (pty.isAlive()) pty.kill();
+    } catch {
+      // Cancellation remains authoritative even if adapter teardown races an
+      // already-exited child.
     }
   }
 
@@ -203,6 +267,10 @@ export class AgentProcess {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    // Cancel a startup_delay or in-flight spawn before it can clear the stop
+    // request and create an untracked process after AgentManager removes it.
+    this.startAttemptGeneration++;
+    this.restartScheduled = false;
     // BUG-040 fix: stopRequested persists ACROSS stop()'s return until
     // handleExit clears it. This is the safety net for the case where the
     // PTY exits later than the Promise.race timeout below.
@@ -382,6 +450,7 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      restartScheduled: this.restartScheduled,
     };
   }
 
@@ -583,6 +652,7 @@ export class AgentProcess {
       this.armForceFresh('image-poison auto-recovery');
       this.appendCrashToRestartsLog(exitCode, 5000, 'IMAGE_POISON_RECOVERY');
       this.status = 'crashed';
+      this.restartScheduled = true;
       this.notifyStatusChange();
       setTimeout(() => {
         if (this.status === 'crashed') {
@@ -610,6 +680,7 @@ export class AgentProcess {
         );
         this.appendCrashToRestartsLog(exitCode, 0, 'CRASH_LOOP');
         this.status = 'halted';
+        this.restartScheduled = false;
         this.notifyStatusChange();
         return;
       }
@@ -625,6 +696,7 @@ export class AgentProcess {
       this.log(`HALTED: exceeded ${this.maxCrashesPerDay} crashes today`);
       this.appendCrashToRestartsLog(exitCode, 0, 'HALTED');
       this.status = 'halted';
+      this.restartScheduled = false;
       this.notifyStatusChange();
       return;
     }
@@ -638,6 +710,7 @@ export class AgentProcess {
     // invisible outside the rotating PM2 daemon stdout log.
     this.appendCrashToRestartsLog(exitCode, backoff, 'CRASH');
     this.status = 'crashed';
+    this.restartScheduled = true;
     this.notifyStatusChange();
 
     setTimeout(() => {

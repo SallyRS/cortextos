@@ -195,6 +195,56 @@ export interface AgentConfig {
    */
   codex_context_cap?: number;
   /**
+   * Absolute, enumerated credential-bearing file or directory paths that the
+   * codex-app-server runtime must deny to model-executed commands. At least
+   * one normalized absolute path is required; relative, empty, or ambiguous
+   * paths fail closed before the app-server is started. The adapter also adds
+   * its active app-server control socket to the same deny policy. This is not
+   * a host-wide read allowlist: omitted readable credentials are out of proof.
+   */
+  codex_credential_deny_paths?: string[];
+  /**
+   * Absolute role-work paths that a codex-app-server agent may write. The
+   * generated profile is read-only everywhere else, so these roots should be
+   * broad enough for the role to create and revise its work without per-file
+   * policy edits while excluding the agent's immutable control surface. The
+   * adapter adds a separate private model-temp root automatically.
+   */
+  codex_writable_paths?: string[];
+  /**
+   * Absolute immutable policy paths that must remain readable but not writable
+   * even when they sit inside a broader role-work root. More-specific `read`
+   * entries override an ancestor `write` entry in the generated profile.
+   * Protected paths may be direct children of a writable root but are rejected
+   * below writable intermediate directories whose rename could bypass policy.
+   */
+  codex_readonly_paths?: string[];
+  /**
+   * Reserved exact-domain policy input for model-executed commands. Codex
+   * 0.144.2 exposes only an effective networkAccess boolean and did not enforce
+   * a configured loopback port boundary in the live contract test, so this
+   * array is required but must remain empty. Use reviewed MCP/built-in tools
+   * for external capabilities until exact-domain enforcement is observable.
+   */
+  codex_network_allow_domains?: string[];
+  /**
+   * Enables the native, read-only Responses web-search tool without enabling
+   * model-executed shell networking. This is explicit per seat and does not
+   * grant browser, app, plugin, MCP, or arbitrary HTTP capabilities.
+   */
+  codex_web_search_enabled?: boolean;
+  /**
+   * Exact environment-variable names that may be loaded from the org and
+   * agent env files into the Codex process. Runtime context variables are
+   * supplied separately by cortextOS.
+   */
+  codex_env_allowlist?: string[];
+  /**
+   * Exact configured MCP server names this role may inherit. Every other
+   * host-configured MCP server is disabled before app-server startup.
+   */
+  codex_mcp_allowlist?: string[];
+  /**
    * Fallback context window cap (tokens) for opencode agents when the OpenCode
    * model cache does not expose a context limit. Only applies to runtime:
    * 'opencode'.
@@ -808,4 +858,6 @@ export interface AgentStatus {
   sessionStart?: string;
   crashCount?: number;
   model?: string;
+  /** True only when AgentProcess has actually scheduled an automatic restart. */
+  restartScheduled?: boolean;
 }

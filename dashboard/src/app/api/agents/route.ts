@@ -4,6 +4,10 @@ import path from 'path';
 import { getFrameworkRoot, getCTXRoot, getAllAgents } from '@/lib/config';
 import { IPCClient } from '@/lib/ipc-client';
 import { getHeartbeat, getHealthStatus } from '@/lib/data/heartbeats';
+import {
+  mutateEnabledAgentsRegistry,
+  readEnabledAgentsRegistry,
+} from '@/lib/enabled-agents-registry';
 
 export const dynamic = 'force-dynamic';
 
@@ -101,20 +105,19 @@ export async function POST(request: NextRequest) {
 
   const frameworkRoot = getFrameworkRoot();
   const ctxRoot = getCTXRoot();
-  const enabledAgentsPath = path.join(ctxRoot, 'config', 'enabled-agents.json');
 
   // Check for duplicate name in enabled-agents.json
+  let existing: Record<string, Record<string, unknown>>;
   try {
-    const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-    const existing = JSON.parse(raw);
-    if (existing[name]) {
-      return Response.json(
-        { error: `Agent "${name}" already exists` },
-        { status: 409 },
-      );
-    }
+    existing = readEnabledAgentsRegistry(ctxRoot);
   } catch {
-    // File doesn't exist yet - that's fine, we'll create it
+    return Response.json({ error: 'Agent registry is unreadable or malformed' }, { status: 500 });
+  }
+  if (existing[name]) {
+    return Response.json(
+      { error: `Agent "${name}" already exists` },
+      { status: 409 },
+    );
   }
 
   try {
@@ -159,27 +162,17 @@ export async function POST(request: NextRequest) {
     }
 
     // 5. Update enabled-agents.json
-    let enabledAgents: Record<string, unknown> = {};
-    try {
-      const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-      enabledAgents = JSON.parse(raw);
-    } catch {
-      // Start fresh
-    }
-
-    enabledAgents[name] = {
-      enabled: true,
-      org,
-      template,
-      createdAt: new Date().toISOString(),
-    };
-
-    await fs.mkdir(path.dirname(enabledAgentsPath), { recursive: true });
-    await fs.writeFile(
-      enabledAgentsPath,
-      JSON.stringify(enabledAgents, null, 2) + '\n',
-      'utf-8',
-    );
+    mutateEnabledAgentsRegistry(ctxRoot, (enabledAgents) => {
+      if (enabledAgents[name]) {
+        throw new Error(`Agent "${name}" was registered concurrently`);
+      }
+      enabledAgents[name] = {
+        enabled: true,
+        org,
+        template,
+        createdAt: new Date().toISOString(),
+      };
+    });
 
     return Response.json({ success: true, agent: { name, org } }, { status: 201 });
   } catch (err: unknown) {

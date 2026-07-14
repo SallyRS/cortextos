@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI, formatValidateError } from '../telegram/api.js';
+import { mutateEnabledAgentsRegistry } from '../utils/enabled-agents-registry.js';
 
 /**
  * BUG-035 fix: discover the cortextOS framework root without depending on
@@ -112,13 +113,6 @@ export function writeDisableMarker(instanceId: string, agent: string, reason: st
   } catch { /* don't block disable on marker-write failure */ }
 }
 
-function writeEnabledAgents(instanceId: string, agents: Record<string, any>): void {
-  const path = getEnabledAgentsPath(instanceId);
-  const dir = join(homedir(), '.cortextos', instanceId, 'config');
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(path, JSON.stringify(agents, null, 2) + '\n', 'utf-8');
-}
-
 export const enableAgentCommand = new Command('enable')
   .argument('<agent>', 'Agent name to enable')
   .option('--instance <id>', 'Instance ID', 'default')
@@ -220,16 +214,16 @@ export const enableAgentCommand = new Command('enable')
       console.error('  Continuing enable. Investigate the validator if this recurs.');
     }
 
-    const agents = readEnabledAgents(options.instance);
-    agents[agent] = {
-      enabled: true,
-      status: 'configured',
-      ...(options.org ? { org: options.org } : {}),
-    };
-    writeEnabledAgents(options.instance, agents);
+    const ctxRoot = join(homedir(), '.cortextos', options.instance);
+    mutateEnabledAgentsRegistry(ctxRoot, (agents) => {
+      agents[agent] = {
+        enabled: true,
+        status: 'configured',
+        ...(options.org ? { org: options.org } : {}),
+      };
+    });
 
     // Create per-agent state directories
-    const ctxRoot = join(homedir(), '.cortextos', options.instance);
     const agentDirs = [
       join(ctxRoot, 'inbox', agent),
       join(ctxRoot, 'inflight', agent),
@@ -262,11 +256,12 @@ export const disableAgentCommand = new Command('disable')
   .option('--instance <id>', 'Instance ID', 'default')
   .description('Disable an agent (stop and deregister)')
   .action(async (agent: string, options: { instance: string }) => {
-    const agents = readEnabledAgents(options.instance);
-    if (agents[agent]) {
-      agents[agent].enabled = false;
-    }
-    writeEnabledAgents(options.instance, agents);
+    mutateEnabledAgentsRegistry(
+      join(homedir(), '.cortextos', options.instance),
+      (agents) => {
+        if (agents[agent]) agents[agent].enabled = false;
+      },
+    );
 
     // Try to stop via daemon IPC
     const ipc = new IPCClient(options.instance);

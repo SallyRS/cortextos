@@ -12,7 +12,7 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
     name: string;
     dir: string;
     constructor(name: string, dir: string) { this.name = name; this.dir = dir; }
-    async start() { /* no-op */ }
+    async start() { return { kind: 'started' }; }
     async stop() { /* no-op */ }
     getStatus() { return { name: this.name, status: 'stopped' }; }
     onExit() { /* no-op */ }

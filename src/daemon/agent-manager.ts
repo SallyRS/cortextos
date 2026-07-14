@@ -16,6 +16,12 @@ import { collectTelegramCommands, registerTelegramCommands } from '../bus/metric
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { stripBom } from '../utils/strip-bom.js';
+import {
+  acquireCodexPermissionStartClaim,
+  releaseCodexPermissionStartClaim,
+  type CodexPermissionStartClaim,
+} from '../utils/codex-permission-migration.js';
+import { readEnabledAgentsRegistry } from '../utils/enabled-agents-registry.js';
 
 type LogFn = (msg: string) => void;
 
@@ -120,6 +126,10 @@ export class AgentManager {
     // commands have no effect across daemon restarts — the daemon would
     // re-discover and re-start any agent dir on disk regardless of user intent.
     const instanceEnabled = this.readInstanceEnableList();
+    if (instanceEnabled === null) {
+      console.error('[agent-manager] Refusing automatic discovery: enabled-agents.json exists but is unreadable or malformed');
+      return;
+    }
 
     for (const { name, dir, org, config } of agentDirs) {
       // Per-agent config.json `enabled: false` (existing behavior, unchanged)
@@ -135,7 +145,14 @@ export class AgentManager {
       }
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
       // of falling back to `this.org` (the daemon's startup org).
-      await this.startAgent(name, dir, config, org);
+      try {
+        await this.startAgent(name, dir, config, org);
+      } catch (err) {
+        // One malformed or unavailable seat must not take the shared daemon or
+        // unrelated agents down. startAgent normally records its own crashed
+        // status; this boundary catches unexpected construction/setup errors.
+        console.error(`[agent-manager] Failed to start ${name}: ${String(err)}`);
+      }
     }
 
     // Successful startup pass — clear .daemon-crashed markers from disk
@@ -152,13 +169,14 @@ export class AgentManager {
    * agents not present in the file default to enabled, matching the existing
    * default-on behavior of `discoverAndStart`.
    */
-  private readInstanceEnableList(): Record<string, { enabled?: boolean; org?: string; status?: string }> {
+  private readInstanceEnableList(): Record<string, { enabled?: boolean; org?: string; status?: string }> | null {
     const enabledFile = join(this.ctxRoot, 'config', 'enabled-agents.json');
     if (!existsSync(enabledFile)) return {};
     try {
-      return JSON.parse(readFileSync(enabledFile, 'utf-8'));
-    } catch {
-      return {}; // corrupt or unreadable — fall through to default-enabled
+      return readEnabledAgentsRegistry(this.ctxRoot);
+    } catch (err) {
+      console.error(`[agent-manager] Failed to read ${enabledFile}: ${String(err)}`);
+      return null;
     }
   }
 
@@ -184,7 +202,7 @@ export class AgentManager {
     if (explicitOrg) return explicitOrg;
 
     const enabledAgents = this.readInstanceEnableList();
-    const entry = enabledAgents[name];
+    const entry = enabledAgents?.[name];
     if (entry?.org) return entry.org;
 
     // Legacy fallback: scan all orgs on disk for a dir named `name`.
@@ -291,29 +309,61 @@ export class AgentManager {
     if (!config) {
       config = this.loadAgentConfig(agentDir);
     }
+    let permissionStartClaim: CodexPermissionStartClaim | null = null;
+    if (config.runtime === 'codex-app-server') {
+      try {
+        permissionStartClaim = acquireCodexPermissionStartClaim(this.ctxRoot, name);
+      } catch (err) {
+        console.error(`[agent-manager] Refusing to start ${name}: could not acquire Codex permission start claim: ${String(err)}`);
+        return;
+      }
+      if (!permissionStartClaim) {
+        console.log(`[agent-manager] Refusing to start ${name}: Codex permission migration hold is active`);
+        return;
+      }
 
-    const env: CtxEnv = {
-      instanceId: this.instanceId,
-      ctxRoot: this.ctxRoot,
-      frameworkRoot: this.frameworkRoot,
-      agentName: name,
-      agentDir,
-      org: resolvedOrg,
-      projectRoot: this.frameworkRoot,
-    };
-
-    const paths = resolvePaths(name, this.instanceId, resolvedOrg);
+      // Bind the runtime to the config revision read inside the shared start /
+      // migration barrier. A migration that completed between discovery and
+      // start cannot leave this process using the stale pre-migration object.
+      const refreshedConfig = this.loadAgentConfig(agentDir);
+      if (refreshedConfig.runtime !== 'codex-app-server') {
+        try {
+          releaseCodexPermissionStartClaim(this.ctxRoot, name, permissionStartClaim);
+        } catch (err) {
+          console.error(`[agent-manager] Codex permission start claim could not be released for ${name}: ${String(err)}`);
+        }
+        console.error(`[agent-manager] Refusing to start ${name}: runtime changed while acquiring the Codex permission barrier`);
+        return;
+      }
+      config = refreshedConfig;
+    }
 
     const log = (msg: string) => {
       console.log(`[${name}] ${msg}`);
     };
-
-    // Read agent .env for Telegram credentials
-    const agentEnvFile = join(agentDir, '.env');
+    let agentProcess!: AgentProcess;
+    let checker!: FastChecker;
+    let paths!: BusPaths;
     let telegramApi: TelegramAPI | undefined;
     let chatId: string | undefined;
     let allowedUserId: string | undefined;
     let botToken: string | undefined;
+
+    try {
+      const env: CtxEnv = {
+        instanceId: this.instanceId,
+        ctxRoot: this.ctxRoot,
+        frameworkRoot: this.frameworkRoot,
+        agentName: name,
+        agentDir,
+        org: resolvedOrg,
+        projectRoot: this.frameworkRoot,
+      };
+
+      paths = resolvePaths(name, this.instanceId, resolvedOrg);
+
+      // Read agent .env for Telegram credentials
+      const agentEnvFile = join(agentDir, '.env');
 
     if (existsSync(agentEnvFile)) {
       // stripBom: Windows tooling writes .env with a UTF-8 BOM that breaks
@@ -369,14 +419,14 @@ export class AgentManager {
       }
     }
 
-    const agentProcess = new AgentProcess(name, env, config, log);
+    agentProcess = new AgentProcess(name, env, config, log);
     // Issue #330: pass the Telegram handle into AgentProcess so CodexAppServerPTY
     // can emit sendChatAction directly from the JSONL stream. Has no effect for
     // claude-code / hermes runtimes — those still use fast-checker.
     if (telegramApi && chatId) {
       agentProcess.setTelegramHandle(telegramApi, chatId);
     }
-    const checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
+    checker = new FastChecker(agentProcess, paths, this.frameworkRoot, {
       log,
       telegramApi,
       chatId,
@@ -393,7 +443,10 @@ export class AgentManager {
       agentProcess.onStatusChanged((status) => {
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
+          const suffix = status.restartScheduled
+            ? ' — auto-restarting'
+            : ' — no restart scheduled; review configuration and start manually';
+          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum})${suffix}`).catch(() => {});
         } else if (status.status === 'halted') {
           tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
         } else if (status.status === 'running' && prevStatus === 'crashed') {
@@ -403,10 +456,41 @@ export class AgentManager {
       });
     }
 
-    this.agents.set(name, { process: agentProcess, checker });
+      this.agents.set(name, { process: agentProcess, checker });
+    } catch (err) {
+      if (permissionStartClaim) {
+        try {
+          releaseCodexPermissionStartClaim(this.ctxRoot, name, permissionStartClaim);
+          permissionStartClaim = null;
+        } catch (releaseErr) {
+          console.error(`[agent-manager] Codex permission start claim could not be released after setup failure for ${name}: ${String(releaseErr)}`);
+        }
+      }
+      console.error(`[agent-manager] Refusing to start ${name}: synchronous setup failed: ${String(err)}`);
+      return;
+    }
+    if (permissionStartClaim) {
+      try {
+        releaseCodexPermissionStartClaim(this.ctxRoot, name, permissionStartClaim);
+        permissionStartClaim = null;
+      } catch (err) {
+        // The retained claim keeps future migration fail-closed. The seat is
+        // already visible in daemon status, so starting it cannot race an
+        // authorized migration even if cleanup itself failed.
+        console.error(`[agent-manager] Codex permission start claim could not be released for ${name}; migration remains blocked: ${String(err)}`);
+      }
+    }
 
     // Start agent
-    await agentProcess.start();
+    const startOutcome = await agentProcess.start();
+    if (startOutcome.kind === 'configuration-error') {
+      log('Runtime configuration failed; cron, checker, and Telegram services remain disabled');
+      return;
+    }
+    if (startOutcome.kind === 'cancelled' || startOutcome.kind === 'runtime-error') {
+      log(`Runtime startup did not complete (${startOutcome.kind}); ancillary services remain disabled`);
+      return;
+    }
 
     // Subtask 2.2: Auto-migrate crons from config.json → crons.json before
     // starting the scheduler, so the scheduler always has a populated crons.json

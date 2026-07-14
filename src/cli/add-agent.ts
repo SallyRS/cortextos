@@ -2,8 +2,14 @@ import { Command } from 'commander';
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, symlinkSync, lstatSync, unlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
-import { OrgContext } from '../types';
+import { AgentConfig, OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
+import {
+  applyCodexCapabilityProfile,
+  buildDefaultCodexCapabilityProfile,
+} from '../utils/codex-capability-profile';
+import { compileCodexCapabilityPolicy } from '../pty/codex-app-server-pty';
+import { mutateEnabledAgentsRegistry } from '../utils/enabled-agents-registry';
 
 const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server', 'opencode'] as const;
 type RuntimeKind = typeof VALID_RUNTIMES[number];
@@ -316,29 +322,36 @@ export const addAgentCommand = new Command('add-agent')
       }
     }
 
+    // A new Codex seat must be startable without inheriting host-wide powers.
+    // add-agent knows the concrete role directory and credential locations, so
+    // it can write a fully explicit, reviewable profile rather than leaving the
+    // runtime to infer authority later. The role directory remains broadly
+    // writable; only identity/config controls and credential files are nested
+    // exceptions. Network, env, and MCP capabilities begin empty by design.
+    if (isCodexAppServer) {
+      seedCodexCapabilityProfile(
+        configPath,
+        agentDir,
+        projectRoot,
+        org,
+        options.instance,
+        name,
+      );
+    }
+
     // Register in enabled-agents.json
     const instanceId = options.instance;
     const ctxRoot = join(homedir(), '.cortextos', instanceId);
-    const enabledPath = join(ctxRoot, 'config', 'enabled-agents.json');
-    const configDir = join(ctxRoot, 'config');
-    mkdirSync(configDir, { recursive: true });
-
-    let enabledAgents: Record<string, any> = {};
-    try {
-      if (existsSync(enabledPath)) {
-        enabledAgents = JSON.parse(readFileSync(enabledPath, 'utf-8'));
-      }
-    } catch { /* start fresh */ }
-
-    if (!enabledAgents[name]) {
+    const registered = mutateEnabledAgentsRegistry(ctxRoot, (enabledAgents) => {
+      if (enabledAgents[name]) return false;
       enabledAgents[name] = {
         enabled: true,
         status: 'configured',
         ...(org ? { org } : {}),
       };
-      writeFileSync(enabledPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
-      console.log(`  Registered in enabled-agents.json`);
-    }
+      return true;
+    });
+    if (registered) console.log(`  Registered in enabled-agents.json`);
 
     console.log(`\n  Agent "${name}" created.`);
     console.log(`\n  Next steps:`);
@@ -346,6 +359,35 @@ export const addAgentCommand = new Command('add-agent')
     console.log(`    2. Customize identity files (IDENTITY.md, SOUL.md, GOALS.md)`);
     console.log(`    3. Start: cortextos start ${name}\n`);
   });
+
+function seedCodexCapabilityProfile(
+  configPath: string,
+  agentDir: string,
+  projectRoot: string,
+  org: string,
+  instance: string,
+  agentName: string,
+): void {
+  const absoluteAgentDir = resolve(agentDir);
+  const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
+  const profile = buildDefaultCodexCapabilityProfile(
+    absoluteAgentDir,
+    projectRoot,
+    org,
+  );
+  const updated = applyCodexCapabilityProfile(config, profile);
+  const stateDir = join(homedir(), '.cortextos', instance, 'state', agentName);
+  compileCodexCapabilityPolicy(
+    updated as AgentConfig,
+    join(stateDir, 'model-tmp'),
+    join(stateDir, 'codex.sock'),
+  );
+  writeFileSync(
+    configPath,
+    JSON.stringify(updated, null, 2) + '\n',
+    'utf-8',
+  );
+}
 
 /**
  * Walk an agent's plugins/cortextos-agent-skills/skills tree and create one

@@ -93,7 +93,7 @@ const mockEnv = {
 
 beforeEach(() => {
   capturedOnExit = null;
-  mockPty.spawn.mockClear();
+  mockPty.spawn.mockReset().mockResolvedValue(undefined);
   mockPty.kill.mockClear();
   mockPty.write.mockClear();
   mockPty.isAlive.mockClear();
@@ -108,6 +108,62 @@ beforeEach(() => {
 });
 
 describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
+  it('tears down the exact retained adapter when a startup attempt is cancelled', async () => {
+    let finishSpawn: (() => void) | null = null;
+    mockPty.spawn.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      finishSpawn = resolve;
+    }));
+    const ap = new AgentProcess('alice', mockEnv, {});
+    const startPromise = ap.start();
+    await Promise.resolve();
+
+    (ap as unknown as { startAttemptGeneration: number }).startAttemptGeneration += 1;
+    finishSpawn!();
+
+    await expect(startPromise).resolves.toEqual({ kind: 'cancelled' });
+    expect(mockPty.kill).toHaveBeenCalledOnce();
+    expect(ap.getStatus().status).toBe('stopped');
+  });
+
+  it('keeps an exit-scheduled recovery authoritative when spawn then rejects', async () => {
+    vi.useFakeTimers();
+    try {
+      mockPty.spawn.mockImplementationOnce(async () => {
+        capturedOnExit!(1, 0);
+        throw new Error('spawn failed after child exit');
+      });
+      const ap = new AgentProcess('alice', mockEnv, {});
+
+      await expect(ap.start()).resolves.toEqual({ kind: 'recovery-pending' });
+      expect(ap.getStatus()).toMatchObject({
+        status: 'crashed',
+        restartScheduled: true,
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop cancels a startup-delay attempt before any PTY can be created', async () => {
+    vi.useFakeTimers();
+    try {
+      const ap = new AgentProcess('alice', mockEnv, { startup_delay: 30 });
+      const startPromise = ap.start();
+      expect(ap.getStatus().status).toBe('starting');
+
+      await ap.stop();
+      expect(ap.getStatus().status).toBe('stopped');
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(startPromise).resolves.toEqual({ kind: 'cancelled' });
+      expect(mockPty.spawn).not.toHaveBeenCalled();
+      expect(ap.getStatus().status).toBe('stopped');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stop() awaits the PTY exit handler before resolving', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});
     await ap.start();
