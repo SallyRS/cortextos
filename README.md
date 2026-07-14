@@ -166,12 +166,14 @@ remain readable and must not be represented as proven credential isolation.
     "/absolute/path/to/role-work/AGENTS.md"
   ],
   "codex_network_allow_domains": [],
+  "codex_web_search_enabled": true,
   "codex_env_allowlist": ["ROLE_SCOPED_TOKEN"],
   "codex_mcp_allowlist": ["role-specific-server"]
 }
 ```
 
-All six arrays are required, though the last four may be empty. Paths must be
+All six arrays and the web-search boolean are required, though the final three
+arrays may be empty. Paths must be
 normalized and absolute. `codex_writable_paths` should name useful directories,
 not individual output files; the agent may create arbitrary descendants there.
 Use more-specific `codex_readonly_paths` for instruction, identity, and routing
@@ -188,7 +190,11 @@ exposes only an effective network-access boolean, and a live contract probe
 showed that an unlisted loopback port remained reachable when network was
 enabled. Model-executed shell network therefore stays off; reviewed MCP and
 built-in tools are the capability seam until exact-domain enforcement is both
-available and readable back. Only allowlisted environment variables are loaded from org/agent env
+available and readable back. A seat may separately set
+`codex_web_search_enabled: true` to receive Codex's native read-only Responses
+web-search tool. This does not enable model-executed shell networking, browser
+control, apps, plugins, MCP servers, or arbitrary HTTP requests. Only
+allowlisted environment variables are loaded from org/agent env
 files, and only allowlisted, already-enabled MCP servers may start. Host apps,
 plugins, browser/computer-control, and image-generation integrations are not
 implicitly inherited.

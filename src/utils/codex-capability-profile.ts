@@ -11,7 +11,9 @@ export const CODEX_CAPABILITY_KEYS = [
 ] as const;
 
 export type CodexCapabilityKey = typeof CODEX_CAPABILITY_KEYS[number];
-export type CodexCapabilityProfile = Record<CodexCapabilityKey, string[]>;
+export type CodexCapabilityProfile = Record<CodexCapabilityKey, string[]> & {
+  codex_web_search_enabled: boolean;
+};
 
 const IMMUTABLE_AGENT_FILES = [
   '.gitignore',
@@ -46,6 +48,7 @@ export function buildDefaultCodexCapabilityProfile(
     codex_network_allow_domains: [],
     codex_env_allowlist: [],
     codex_mcp_allowlist: [],
+    codex_web_search_enabled: false,
   };
 }
 
@@ -67,6 +70,11 @@ export function mergeCodexCapabilityProfile(
       ? [...new Set([...defaults[key], ...current])]
       : [...new Set(current)];
   }
+  const webSearch = config.codex_web_search_enabled;
+  if (webSearch !== undefined && typeof webSearch !== 'boolean') {
+    throw new Error('codex_web_search_enabled is present but malformed; refusing to infer a replacement');
+  }
+  merged.codex_web_search_enabled = webSearch ?? defaults.codex_web_search_enabled;
   return merged;
 }
 

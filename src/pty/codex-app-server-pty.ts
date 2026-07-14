@@ -208,6 +208,7 @@ export class CodexAppServerPTY {
   private readonly _writablePaths: string[];
   private readonly _readonlyPaths: string[];
   private readonly _networkAllowDomains: string[];
+  private readonly _webSearchEnabled: boolean;
   private readonly _envAllowlist: Set<string>;
   private readonly _mcpAllowlist: Set<string>;
   private readonly _mcpStartupStates = new Map<string, McpServerStartupState>();
@@ -237,6 +238,7 @@ export class CodexAppServerPTY {
     this._writablePaths = compiled.writablePaths;
     this._readonlyPaths = compiled.readonlyPaths;
     this._networkAllowDomains = compiled.networkAllowDomains;
+    this._webSearchEnabled = compiled.webSearchEnabled;
     this._envAllowlist = new Set(compiled.envAllowlist);
     this._mcpAllowlist = new Set(compiled.mcpAllowlist);
     this._permissionProfileId = compiled.profile.id;
@@ -573,6 +575,7 @@ export class CodexAppServerPTY {
       const spawnFn = this._spawnFn!;
       const mcpConfigArgs = this.buildMcpConfigArgs();
       const pty = spawnFn('codex', [
+        ...(this._webSearchEnabled ? ['--search'] : []),
         'app-server',
         '--strict-config',
         '--enable', 'goals',
@@ -1625,6 +1628,7 @@ export function compileCodexCapabilityPolicy(
   writablePaths: string[];
   readonlyPaths: string[];
   networkAllowDomains: string[];
+  webSearchEnabled: boolean;
   envAllowlist: string[];
   mcpAllowlist: string[];
   profile: { id: string; configArgs: string[] };
@@ -1638,6 +1642,7 @@ export function compileCodexCapabilityPolicy(
   const readonlyPaths = validateReadonlyPaths(config.codex_readonly_paths);
   assertSensitivePathsHaveNoAliases(readonlyPaths, 'codex_readonly_paths');
   const networkAllowDomains = validateNetworkAllowDomains(config.codex_network_allow_domains);
+  const webSearchEnabled = validateWebSearchEnabled(config.codex_web_search_enabled);
   const envAllowlist = validateEnvAllowlist(config.codex_env_allowlist);
   const mcpAllowlist = validateMcpAllowlist(config.codex_mcp_allowlist);
   const profile = buildPermissionProfile(
@@ -1652,6 +1657,7 @@ export function compileCodexCapabilityPolicy(
     writablePaths,
     readonlyPaths,
     networkAllowDomains,
+    webSearchEnabled,
     envAllowlist,
     mcpAllowlist,
     profile,
@@ -1721,6 +1727,13 @@ function validateNetworkAllowDomains(domains: string[] | undefined): string[] {
     );
   }
   return [];
+}
+
+function validateWebSearchEnabled(enabled: boolean | undefined): boolean {
+  if (typeof enabled !== 'boolean') {
+    throw new Error('codex_web_search_enabled must be an explicit boolean');
+  }
+  return enabled;
 }
 
 function validateEnvAllowlist(names: string[] | undefined): string[] {

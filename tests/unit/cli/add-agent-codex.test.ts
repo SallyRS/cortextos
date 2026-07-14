@@ -125,6 +125,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
       join(agentDir, 'goals.json'),
     ]));
     expect(cfg.codex_network_allow_domains).toEqual([]);
+    expect(cfg.codex_web_search_enabled).toBe(false);
     expect(cfg.codex_env_allowlist).toEqual([]);
     expect(cfg.codex_mcp_allowlist).toEqual([]);
   });

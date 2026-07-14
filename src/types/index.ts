@@ -228,6 +228,12 @@ export interface AgentConfig {
    */
   codex_network_allow_domains?: string[];
   /**
+   * Enables the native, read-only Responses web-search tool without enabling
+   * model-executed shell networking. This is explicit per seat and does not
+   * grant browser, app, plugin, MCP, or arbitrary HTTP capabilities.
+   */
+  codex_web_search_enabled?: boolean;
+  /**
    * Exact environment-variable names that may be loaded from the org and
    * agent env files into the Codex process. Runtime context variables are
    * supplied separately by cortextOS.

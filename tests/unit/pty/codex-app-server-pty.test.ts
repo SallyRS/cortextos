@@ -97,6 +97,7 @@ const secureConfig = {
   codex_writable_paths: ['/tmp/fw/role-work'],
   codex_readonly_paths: ['/tmp/fw/role-work/AGENTS.md'],
   codex_network_allow_domains: [],
+  codex_web_search_enabled: false,
   codex_env_allowlist: ['CC_AGENT_ACTION_TOKEN'],
   codex_mcp_allowlist: [],
 };
@@ -323,6 +324,8 @@ describe('CodexAppServerPTY permission profile policy', () => {
     [{ ...secureConfig, codex_network_allow_domains: undefined }, /codex_network_allow_domains/],
     [{ ...secureConfig, codex_network_allow_domains: ['*'] }, /codex_network_allow_domains/],
     [{ ...secureConfig, codex_network_allow_domains: ['127.0.0.1:8091'] }, /must remain empty/],
+    [{ ...secureConfig, codex_web_search_enabled: undefined }, /codex_web_search_enabled/],
+    [{ ...secureConfig, codex_web_search_enabled: 'yes' }, /codex_web_search_enabled/],
     [{ ...secureConfig, codex_env_allowlist: undefined }, /codex_env_allowlist/],
     [{ ...secureConfig, codex_env_allowlist: ['PATH'] }, /codex_env_allowlist/],
     [{ ...secureConfig, codex_env_allowlist: ['CTX_ROOT'] }, /codex_env_allowlist/],
@@ -556,12 +559,43 @@ describe('CodexAppServerPTY permission profile policy', () => {
 
     const args = spawn.mock.calls[0][1] as string[];
     expect(args).toContain('--strict-config');
+    expect(args).not.toContain('--search');
     for (const feature of ['apps', 'plugins', 'browser_use', 'computer_use', 'in_app_browser', 'image_generation']) {
       expect(args).toContain(feature);
     }
     expect(args).toContain('mcp_servers={\"ambient-host-server\"={enabled=false}}');
     expect(args.some((arg) => arg.includes(permissionProfileId(pty)))).toBe(true);
     expect(JSON.stringify(args)).not.toMatch(/danger-full-access|dangerFullAccess|sandbox_mode/);
+  });
+
+  it('enables native read-only web search without enabling raw profile network', async () => {
+    spawnSyncMock.mockReturnValue({
+      status: 0,
+      stdout: '[]',
+      stderr: '',
+      error: undefined,
+    });
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_web_search_enabled: true,
+    });
+    const spawn = vi.fn().mockReturnValue({
+      pid: 88,
+      write: vi.fn(),
+      onData: vi.fn(),
+      onExit: vi.fn(),
+      kill: vi.fn(),
+    });
+    (pty as unknown as { _spawnFn: typeof spawn; _alive: boolean })._spawnFn = spawn;
+    (pty as unknown as { _alive: boolean })._alive = true;
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await (pty as unknown as { startAppServer(): Promise<void> }).startAppServer();
+
+    const args = spawn.mock.calls[0][1] as string[];
+    expect(args.slice(0, 2)).toEqual(['--search', 'app-server']);
+    const overrides = args.filter((arg) => arg.startsWith('permissions.'));
+    expect(overrides.some((arg) => /\.network\.enabled=false$/.test(arg))).toBe(true);
   });
 
   it('cleans private temp and socket state on an unexpected app-server exit', async () => {

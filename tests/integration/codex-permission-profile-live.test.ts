@@ -78,6 +78,7 @@ const LIVE = process.env.CODEX_PERMISSION_PROFILE_LIVE === '1';
       codex_writable_paths: [roleWorkDir],
       codex_readonly_paths: [nestedControlPath],
       codex_network_allow_domains: [],
+      codex_web_search_enabled: true,
       codex_env_allowlist: [],
       codex_mcp_allowlist: [],
     });
@@ -198,7 +199,8 @@ const LIVE = process.env.CODEX_PERMISSION_PROFILE_LIVE === '1';
         runtime: 'codex-app-server', working_directory: policyDir,
         codex_credential_deny_paths: [secretPath],
         codex_writable_paths: [roleWorkDir], codex_readonly_paths: [],
-        codex_network_allow_domains: [], codex_env_allowlist: [],
+        codex_network_allow_domains: [], codex_web_search_enabled: false,
+        codex_env_allowlist: [],
         codex_mcp_allowlist: [],
       })).toThrow(/hard-linked file/);
     } finally {
@@ -218,7 +220,8 @@ const LIVE = process.env.CODEX_PERMISSION_PROFILE_LIVE === '1';
         runtime: 'codex-app-server', working_directory: policyDir,
         codex_credential_deny_paths: [secretPath],
         codex_writable_paths: [roleWorkDir], codex_readonly_paths: [nestedControlPath],
-        codex_network_allow_domains: [], codex_env_allowlist: [],
+        codex_network_allow_domains: [], codex_web_search_enabled: false,
+        codex_env_allowlist: [],
         codex_mcp_allowlist: [],
       })).toThrow(/codex_readonly_paths contains a hard-linked file/);
     } finally {
@@ -270,6 +273,7 @@ const LIVE = process.env.CODEX_PERMISSION_PROFILE_LIVE === '1';
       codex_writable_paths: [roleWorkDir],
       codex_readonly_paths: [nestedControlPath],
       codex_network_allow_domains: [],
+      codex_web_search_enabled: false,
       codex_env_allowlist: [],
       codex_mcp_allowlist: [],
     };
@@ -335,7 +339,8 @@ const LIVE = process.env.CODEX_PERMISSION_PROFILE_LIVE === '1';
       runtime: 'codex-app-server', working_directory: implicitCwd,
       codex_credential_deny_paths: [secretPath],
       codex_writable_paths: [implicitCwd], codex_readonly_paths: [],
-      codex_network_allow_domains: [], codex_env_allowlist: [],
+      codex_network_allow_domains: [], codex_web_search_enabled: false,
+      codex_env_allowlist: [],
       codex_mcp_allowlist: [],
     });
     try {
@@ -358,7 +363,8 @@ const LIVE = process.env.CODEX_PERMISSION_PROFILE_LIVE === '1';
       runtime: 'codex-app-server', working_directory: policyDir,
       codex_credential_deny_paths: [secretPath], codex_writable_paths: [],
       codex_readonly_paths: [], codex_network_allow_domains: [],
-      codex_env_allowlist: [], codex_mcp_allowlist: [],
+      codex_web_search_enabled: false, codex_env_allowlist: [],
+      codex_mcp_allowlist: [],
     });
     try {
       await readonly.spawn('fresh', '');
