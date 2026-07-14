@@ -14,7 +14,7 @@ vi.mock('../../../src/daemon/agent-process.js', () => ({
       this.name = name;
       this.dir = dir;
     }
-    async start() { /* no-op */ }
+    async start() { return { kind: 'started' }; }
     async stop() { /* no-op */ }
     getStatus() { return { name: this.name, status: 'stopped' }; }
     onExit() { /* no-op */ }
@@ -105,6 +105,23 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     expect(startSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('isolates one malformed seat instead of aborting unrelated agent startup', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const startSpy = vi.spyOn(am, 'startAgent').mockImplementation(async (name) => {
+      if (name === 'alice') throw new Error('missing explicit Codex capability profile');
+    });
+
+    await expect(am.discoverAndStart()).resolves.toBeUndefined();
+
+    expect(startSpy).toHaveBeenCalledTimes(2);
+    expect(startSpy.mock.calls.map((call) => call[0]).sort()).toEqual(['alice', 'bob']);
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to start alice'),
+    );
+    errorSpy.mockRestore();
+  });
+
   it('still respects per-agent config.json enabled: false (existing behavior)', async () => {
     // Per-agent config.json takes precedence — this is the legacy behavior we
     // explicitly preserved in the BUG-028 fix
@@ -123,7 +140,7 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     expect(startSpy).toHaveBeenCalledWith('bob', expect.any(String), expect.any(Object), 'acme');
   });
 
-  it('handles corrupt enabled-agents.json by defaulting to enabled-all', async () => {
+  it('fails closed instead of auto-starting when enabled-agents.json is corrupt', async () => {
     writeFileSync(
       join(ctxRoot, 'config', 'enabled-agents.json'),
       'this is not valid json',
@@ -131,11 +148,15 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
 
     const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
     const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     await am.discoverAndStart();
 
-    // Corrupt file is treated as missing — all discovered agents start
-    expect(startSpy).toHaveBeenCalledTimes(2);
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Refusing automatic discovery'),
+    );
+    errorSpy.mockRestore();
   });
 });
 

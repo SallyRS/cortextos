@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir, platform } from 'os';
 import { execSync, spawn, spawnSync } from 'child_process';
 import { IPCClient } from '../daemon/ipc-server.js';
+import { mutateEnabledAgentsRegistry } from '../utils/enabled-agents-registry.js';
 
 const IS_WINDOWS = platform() === 'win32';
 const SAFE_CMD = /^[@a-z0-9._/-]+$/i;
@@ -165,26 +166,20 @@ export const startCommand = new Command('start')
     if (agent) {
       // Auto-register in enabled-agents.json if not already present
       const ctxRoot = join(homedir(), '.cortextos', options.instance);
-      const enabledPath = join(ctxRoot, 'config', 'enabled-agents.json');
-      let enabledAgents: Record<string, any> = {};
-      try {
-        if (existsSync(enabledPath)) {
-          enabledAgents = JSON.parse(readFileSync(enabledPath, 'utf-8'));
-        }
-      } catch { /* ignore */ }
-
-      if (!enabledAgents[agent]) {
+      const registered = mutateEnabledAgentsRegistry(ctxRoot, (enabledAgents) => {
+        if (enabledAgents[agent]) return false;
         // Try to detect org from existing entries or project structure
-        const existingOrg = Object.values(enabledAgents as Record<string, any>).find((e: any) => e.org)?.org;
+        const existingOrg = Object.values(enabledAgents).find((entry) => (
+          typeof entry.org === 'string' && entry.org
+        ))?.org;
         enabledAgents[agent] = {
           enabled: true,
           status: 'configured',
           ...(existingOrg ? { org: existingOrg } : {}),
         };
-        mkdirSync(join(ctxRoot, 'config'), { recursive: true });
-        writeFileSync(enabledPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
-        console.log(`  Registered ${agent} in enabled-agents.json`);
-      }
+        return true;
+      });
+      if (registered) console.log(`  Registered ${agent} in enabled-agents.json`);
 
       console.log(`Starting agent: ${agent}`);
       const response = await ipc.send({ type: 'start-agent', agent, source: 'cortextos start' });

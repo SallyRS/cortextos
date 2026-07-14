@@ -3,6 +3,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { IPCClient } from '@/lib/ipc-client';
+import {
+  mutateEnabledAgentsRegistry,
+  readEnabledAgentsRegistry,
+} from '@/lib/enabled-agents-registry';
 
 export const dynamic = 'force-dynamic';
 
@@ -89,21 +93,13 @@ export async function POST(
     switch (action) {
       case 'enable': {
         const ctxRoot = getCTXRoot();
-        const enabledAgentsPath = path.join(ctxRoot, 'config', 'enabled-agents.json');
-        let enabledAgents: Record<string, unknown> = {};
-        try {
-          const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-          enabledAgents = JSON.parse(raw);
-        } catch { /* file may not exist yet */ }
-        enabledAgents[decoded] = {
-          ...(typeof enabledAgents[decoded] === 'object' && enabledAgents[decoded] !== null
-            ? (enabledAgents[decoded] as object)
-            : {}),
-          enabled: true,
-          ...(safeOrg ? { org: safeOrg } : {}),
-        };
-        await fs.mkdir(path.dirname(enabledAgentsPath), { recursive: true });
-        await fs.writeFile(enabledAgentsPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
+        mutateEnabledAgentsRegistry(ctxRoot, (enabledAgents) => {
+          enabledAgents[decoded] = {
+            ...(enabledAgents[decoded] ?? {}),
+            enabled: true,
+            ...(safeOrg ? { org: safeOrg } : {}),
+          };
+        });
         registryMessage = 'enabled in registry';
         ipcResult = await ipc.send({ type: 'start-agent', agent: decoded });
         break;
@@ -112,14 +108,10 @@ export async function POST(
       case 'disable': {
         ipcResult = await ipc.send({ type: 'stop-agent', agent: decoded });
         const ctxRoot = getCTXRoot();
-        const enabledAgentsPath = path.join(ctxRoot, 'config', 'enabled-agents.json');
         try {
-          const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-          const enabledAgents = JSON.parse(raw) as Record<string, unknown>;
-          if (enabledAgents[decoded] && typeof enabledAgents[decoded] === 'object') {
-            (enabledAgents[decoded] as Record<string, unknown>).enabled = false;
-          }
-          await fs.writeFile(enabledAgentsPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
+          mutateEnabledAgentsRegistry(ctxRoot, (enabledAgents) => {
+            if (enabledAgents[decoded]) enabledAgents[decoded].enabled = false;
+          });
           registryMessage = 'disabled in registry';
         } catch {
           registryMessage = 'registry update failed (non-fatal)';
@@ -185,15 +177,13 @@ export async function DELETE(
   }
 
   const ctxRoot = getCTXRoot();
-  const enabledAgentsPath = path.join(ctxRoot, 'config', 'enabled-agents.json');
   const deleteFiles = request.nextUrl.searchParams.get('deleteFiles') === 'true';
 
   // Look up org from enabled-agents.json
   let org = '';
   let enabledAgents: Record<string, { org?: string; enabled?: boolean }> = {};
   try {
-    const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-    enabledAgents = JSON.parse(raw);
+    enabledAgents = readEnabledAgentsRegistry(ctxRoot);
     if (enabledAgents[decoded]) {
       org = enabledAgents[decoded].org ?? '';
     }
@@ -224,12 +214,9 @@ export async function DELETE(
 
   // 2. Remove from enabled-agents.json
   try {
-    delete enabledAgents[decoded];
-    await fs.writeFile(
-      enabledAgentsPath,
-      JSON.stringify(enabledAgents, null, 2) + '\n',
-      'utf-8',
-    );
+    mutateEnabledAgentsRegistry(ctxRoot, (registry) => {
+      delete registry[decoded];
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[api/agents/${decoded}/lifecycle] failed to update enabled-agents.json:`, message);

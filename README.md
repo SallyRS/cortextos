@@ -140,6 +140,89 @@ Every agent's `config.json` carries an explicit `runtime` field that the daemon 
 
 Pass `--runtime <kind>` on `add-agent` to set it at scaffold time, or edit the field in `config.json` and restart the agent. The default is `claude-code`. Today only `--template agent` (and the alias `--template agent-codex`) supports `--runtime codex-app-server` — pairing the codex runtime with `--template orchestrator`/`analyst`/`m2c1-worker`/`hermes` errors with a clean message until codex variants of those templates ship.
 
+### Codex role-capability profile
+
+Unattended `codex-app-server` agents require an explicit capability profile in
+their `config.json`. The runtime starts from Codex's `:read-only` profile, then
+adds broad role-work roots while keeping nested policy files immutable. This is
+intended to give an agent freedom inside its job while denying an enumerated,
+reviewed set of credential files and avoiding ambient connectors or writable
+directories from the host account. Because `:read-only` remains the base, this
+is not a general host-read allowlist: files omitted from the deny inventory can
+remain readable and must not be represented as proven credential isolation.
+
+```json
+{
+  "codex_credential_deny_paths": [
+    "/absolute/path/to/agent/.env",
+    "/absolute/path/to/.codex/auth.json",
+    "/absolute/path/to/.codex/config.toml"
+  ],
+  "codex_writable_paths": [
+    "/absolute/path/to/role-work",
+    "/absolute/path/to/shared-deliverables"
+  ],
+  "codex_readonly_paths": [
+    "/absolute/path/to/role-work/AGENTS.md"
+  ],
+  "codex_network_allow_domains": [],
+  "codex_env_allowlist": ["ROLE_SCOPED_TOKEN"],
+  "codex_mcp_allowlist": ["role-specific-server"]
+}
+```
+
+All six arrays are required, though the last four may be empty. Paths must be
+normalized and absolute. `codex_writable_paths` should name useful directories,
+not individual output files; the agent may create arbitrary descendants there.
+Use more-specific `codex_readonly_paths` for instruction, identity, and routing
+files that are direct children of a writable root. A protected path below a
+writable intermediate directory is rejected because renaming that intermediate
+directory can relocate the file outside a path-based rule. Existing credential
+files and read-only control files must have exactly one hard-link name before
+launch; symbolic links and pre-existing hard-link aliases fail closed. The
+adapter adds one private
+`state/<agent>/model-tmp` write root for normal scratch-file use, removes it on
+exit, and keeps the rest of the daemon state directory outside model writes.
+For Codex 0.144.2, `codex_network_allow_domains` must remain empty: the runtime
+exposes only an effective network-access boolean, and a live contract probe
+showed that an unlisted loopback port remained reachable when network was
+enabled. Model-executed shell network therefore stays off; reviewed MCP and
+built-in tools are the capability seam until exact-domain enforcement is both
+available and readable back. Only allowlisted environment variables are loaded from org/agent env
+files, and only allowlisted, already-enabled MCP servers may start. Host apps,
+plugins, browser/computer-control, and image-generation integrations are not
+implicitly inherited.
+
+The adapter verifies the returned profile parent, exact writable-root set,
+network state, and active MCP inventory on every thread start/resume and full
+settings update. Run the optional real-parser/sandbox check
+after changing this contract:
+
+```bash
+CODEX_PERMISSION_PROFILE_LIVE=1 npx vitest run \
+  tests/integration/codex-permission-profile-live.test.ts
+```
+
+Fresh Codex agents receive a concrete baseline profile from `add-agent`. For an
+existing agent, the migration command is dry-run by default and prints hashes
+over the exact proposed profile and complete source config. It writes only when
+the seat is absent from an explicit daemon-status response and both reviewed
+hashes are supplied; ambiguous IPC failures fail closed. A dedicated durable
+migration hold and the daemon's per-seat start claim share one barrier, blocking
+concurrent starts without changing the ordinary enabled/autostart state:
+
+```bash
+cortextos migrate-codex-permissions <agent> --org <org>
+cortextos migrate-codex-permissions <agent> --org <org> \
+  --apply --expect <profile-sha256> --expect-config <config-sha256>
+```
+
+Stop a running seat through its normal reviewed control path before applying,
+and keep the daemon available for the exact status read-back. Applying the
+profile never starts, enables, restarts, or changes the autostart state of the
+seat. A concurrent config edit invalidates the full-config compare-and-swap
+hash and fails closed.
+
 `opencode` agents run OpenCode's terminal UI as a persistent PTY and are provider-agnostic — set any `provider/model` in `config.json` (default `openai/gpt-4.1-nano`). Scaffold with `--template agent --runtime opencode` (auto-maps to the `agent-opencode` bootstrap) or `--template agent-opencode` directly. OpenCode agents also ship the **context-handoff lifecycle**: the daemon watches each session's context-window usage and, at a configurable threshold (`ctx_handoff_threshold`, default 60%), prompts the agent to write a handoff document under `memory/handoffs/` and hard-restart into a fresh session that resumes from that doc — so long-running agents never lose state to a context overflow. Tune it with `ctx_warning_threshold` (default 30%) and `ctx_handoff_threshold` in `config.json`.
 
 ---

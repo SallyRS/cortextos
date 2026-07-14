@@ -1,7 +1,20 @@
-import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { isAbsolute, join, normalize } from 'path';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
+import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
+import { spawnSync } from 'child_process';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -50,6 +63,13 @@ interface ThreadResponse {
     id: string;
     extends?: string | null;
   } | null;
+  sandbox?: {
+    type?: unknown;
+    writableRoots?: unknown;
+    networkAccess?: unknown;
+    excludeTmpdirEnvVar?: unknown;
+    excludeSlashTmp?: unknown;
+  };
 }
 
 interface PermissionProfileListResponse {
@@ -58,6 +78,25 @@ interface PermissionProfileListResponse {
     allowed: boolean;
   }>;
   nextCursor?: string | null;
+}
+
+interface McpServerStatusListResponse {
+  data: Array<{
+    name: string;
+    serverInfo: unknown;
+    tools: unknown;
+    resources: unknown;
+    resourceTemplates: unknown;
+    authStatus: unknown;
+  }>;
+  nextCursor: string | null;
+}
+
+type McpServerStartupState = 'starting' | 'ready' | 'failed' | 'cancelled';
+
+interface McpReadinessWaiter {
+  resolve: () => void;
+  reject: (error: Error) => void;
 }
 
 interface SkillsListResponse {
@@ -90,6 +129,39 @@ const SOCKET_BASENAME = 'codex.sock';
 const SOCKET_PATH_WARN_BYTES = 100;
 const BOOTSTRAP_PATTERN = '[codex-app-server] ready';
 const PERMISSION_PROFILE_PREFIX = 'cortextos-fleet';
+const MCP_STARTUP_TIMEOUT_MS = 10_000;
+const EXTERNAL_FEATURES_DISABLED_FOR_FLEET = [
+  'apps',
+  'plugins',
+  'browser_use',
+  'computer_use',
+  'in_app_browser',
+  'image_generation',
+  'remote_plugin',
+  'plugin_sharing',
+] as const;
+const BASE_ENV_VARS = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'] as const;
+const RESERVED_ENV_VARS = new Set([
+  ...BASE_ENV_VARS,
+  'ALL_PROXY',
+  'BASH_ENV',
+  'CODEX_HOME',
+  'CURL_CA_BUNDLE',
+  'ENV',
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'NO_PROXY',
+  'PERL5OPT',
+  'PYTHONHOME',
+  'PYTHONPATH',
+  'RUBYOPT',
+  'SSL_CERT_FILE',
+  'TEMP',
+  'TMP',
+  'ZDOTDIR',
+]);
 
 const SLASH_REWRITE_RE = /^\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i;
 const LOCAL_SLASH_COMMANDS = new Set(['goal']);
@@ -105,6 +177,8 @@ const LOCAL_SLASH_COMMANDS = new Set(['goal']);
  */
 export class CodexAppServerPTY {
   private _alive = false;
+  private _startupCancelled = false;
+  private _startupComplete = false;
   private _executing = false;
   private _activeTurnId: string | null = null;
   private _writeBuffer = '';
@@ -122,6 +196,7 @@ export class CodexAppServerPTY {
   private _env: CtxEnv;
   private _config: AgentConfig;
   private _stateDir: string;
+  private readonly _modelTempDir: string;
   private _cwd: string;
   private _socketPath: string;
   private _socketListenArg: string;
@@ -130,6 +205,13 @@ export class CodexAppServerPTY {
   private _socketPointerPath: string;
   private readonly _permissionProfileId: string;
   private readonly _permissionProfileConfigArgs: string[];
+  private readonly _writablePaths: string[];
+  private readonly _readonlyPaths: string[];
+  private readonly _networkAllowDomains: string[];
+  private readonly _envAllowlist: Set<string>;
+  private readonly _mcpAllowlist: Set<string>;
+  private readonly _mcpStartupStates = new Map<string, McpServerStartupState>();
+  private _mcpReadinessWaiter: McpReadinessWaiter | null = null;
   private _threadId: string | null = null;
   private _telegramApi: TelegramAPI | null = null;
   private _chatId: string | null = null;
@@ -140,16 +222,25 @@ export class CodexAppServerPTY {
     this._config = config;
     this._cwd = config.working_directory || env.agentDir || process.cwd();
     this._stateDir = join(env.ctxRoot, 'state', env.agentName);
+    this._modelTempDir = join(this._stateDir, 'model-tmp');
     this._threadStatePath = join(this._stateDir, 'codex-app-server-thread.json');
     this._socketPointerPath = join(this._stateDir, 'codex-app-server-socket.json');
-    const credentialDenyPaths = validateCredentialDenyPaths(config.codex_credential_deny_paths);
     const socket = this.resolveSocketPath();
     this._socketPath = socket.path;
     this._socketListenArg = socket.listenArg;
     this._socketCwd = socket.cwd;
-    const profile = buildPermissionProfile(credentialDenyPaths, this._socketPath);
-    this._permissionProfileId = profile.id;
-    this._permissionProfileConfigArgs = profile.configArgs;
+    const compiled = compileCodexCapabilityPolicy(
+      config,
+      this._modelTempDir,
+      this._socketPath,
+    );
+    this._writablePaths = compiled.writablePaths;
+    this._readonlyPaths = compiled.readonlyPaths;
+    this._networkAllowDomains = compiled.networkAllowDomains;
+    this._envAllowlist = new Set(compiled.envAllowlist);
+    this._mcpAllowlist = new Set(compiled.mcpAllowlist);
+    this._permissionProfileId = compiled.profile.id;
+    this._permissionProfileConfigArgs = compiled.profile.configArgs;
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
   }
 
@@ -158,7 +249,17 @@ export class CodexAppServerPTY {
       throw new Error('CodexAppServerPTY already spawned. Kill first.');
     }
 
-    ensureDir(this._stateDir);
+    assertSensitivePathsHaveNoAliases(
+      validateCredentialDenyPaths(this._config.codex_credential_deny_paths),
+      'codex_credential_deny_paths',
+    );
+    assertSensitivePathsHaveNoAliases(
+      validateReadonlyPaths(this._config.codex_readonly_paths),
+      'codex_readonly_paths',
+    );
+    this._mcpStartupStates.clear();
+    this._startupCancelled = false;
+    this._startupComplete = false;
     this._alive = true;
 
     try {
@@ -167,12 +268,18 @@ export class CodexAppServerPTY {
       await this.initializeRpc();
       await this.startOrResumeThread(mode);
       this._outputBuffer.push(`${BOOTSTRAP_PATTERN} thread=${this._threadId}\n`);
+      this._startupComplete = true;
       if (prompt.trim()) {
         this.queueTurn([{ type: 'text', text: prompt, text_elements: [] }]);
       }
     } catch (err) {
       this._alive = false;
+      this._startupComplete = false;
       this._outputBuffer.push(`[codex-app-server] degraded: ${err}\n`);
+      // This adapter never became a running AgentProcess. Suppress the normal
+      // runtime-exit callback while cleaning up so AgentProcess does not queue
+      // a phantom recovery timer for a synchronous setup failure.
+      this._onExitHandler = null;
       this.kill();
       throw err;
     }
@@ -198,7 +305,11 @@ export class CodexAppServerPTY {
   }
 
   kill(): void {
+    this._startupCancelled = true;
+    this._startupComplete = false;
     this._alive = false;
+    this.rejectMcpReadiness(new PermissionProfileError('Codex app-server stopped before MCP startup completed'));
+    this._mcpStartupStates.clear();
     this._activeTurnId = null;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
@@ -215,6 +326,7 @@ export class CodexAppServerPTY {
       this._appServerPty = null;
     }
     this.removeSocket();
+    this.cleanupPrivateModelTempDir();
     this._onExitHandler?.(0, undefined);
     this._onExitHandler = null;
   }
@@ -412,16 +524,38 @@ export class CodexAppServerPTY {
     let lastErr: unknown;
 
     for (let attempt = 0; attempt < delays.length; attempt += 1) {
+      if (this._startupCancelled) {
+        throw new Error('Codex app-server startup was cancelled');
+      }
+      // An app-server may have exited during the prior attempt. A new retry is
+      // live again unless kill() explicitly cancelled the startup generation.
+      // Unexpected exit cleanup removes model-tmp, so every attempt recreates
+      // and revalidates the private TMPDIR before constructing the child env.
+      this.preparePrivateModelTempDir();
+      this._alive = true;
       try {
         this.removeSocket();
         await this.startAppServer();
+        if (this._startupCancelled) {
+          this.cleanupSpawnAttempt();
+          throw new Error('Codex app-server startup was cancelled');
+        }
+        if (!this._alive) {
+          throw new Error('Codex app-server exited during startup');
+        }
         return;
       } catch (err) {
         lastErr = err;
         this.cleanupSpawnAttempt();
         this._outputBuffer.push(`[codex-app-server] spawn attempt ${attempt + 1} failed: ${err}\n`);
+        if (this._startupCancelled) {
+          throw new Error('Codex app-server startup was cancelled');
+        }
         if (attempt < delays.length - 1) {
           await sleep(delays[attempt]);
+          if (this._startupCancelled) {
+            throw new Error('Codex app-server startup was cancelled');
+          }
         }
       }
     }
@@ -437,10 +571,13 @@ export class CodexAppServerPTY {
       }
 
       const spawnFn = this._spawnFn!;
+      const mcpConfigArgs = this.buildMcpConfigArgs();
       const pty = spawnFn('codex', [
         'app-server',
         '--strict-config',
         '--enable', 'goals',
+        ...EXTERNAL_FEATURES_DISABLED_FOR_FLEET.flatMap((feature) => ['--disable', feature]),
+        ...mcpConfigArgs,
         ...this._permissionProfileConfigArgs,
         '--listen', this._socketListenArg,
       ], {
@@ -460,10 +597,25 @@ export class CodexAppServerPTY {
       });
       pty.onExit(({ exitCode, signal }) => {
         if (this._appServerPty !== pty) return;
+        const publishRuntimeExit = this._startupComplete;
         this._appServerPty = null;
         this._alive = false;
+        this._startupComplete = false;
+        this.rejectMcpReadiness(new PermissionProfileError(
+          'Codex app-server exited before MCP startup completed',
+        ));
+        this._mcpStartupStates.clear();
         this.rejectTurnCompletion(new Error('Codex app-server exited'));
-        this._onExitHandler?.(exitCode, signal);
+        if (this._rpc) {
+          this._rpc.close();
+          this._rpc = null;
+        }
+        this.removeSocket();
+        this.cleanupPrivateModelTempDir();
+        // A failed internal launch attempt belongs to the bounded adapter
+        // retry loop. AgentProcess only receives exits after this adapter has
+        // completed its profile/MCP/thread read-back and declared startup.
+        if (publishRuntimeExit) this._onExitHandler?.(exitCode, signal);
       });
 
       this.waitForSocket().then(resolve, reject);
@@ -473,6 +625,8 @@ export class CodexAppServerPTY {
   private async waitForSocket(timeoutMs = 10000): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
+      if (this._startupCancelled) throw new Error('Codex app-server startup was cancelled');
+      if (!this._alive) throw new Error('Codex app-server exited during startup');
       if (existsSync(this._socketPath)) return;
       await sleep(100);
     }
@@ -496,6 +650,7 @@ export class CodexAppServerPTY {
     });
     this._rpc?.notify('initialized');
     await this.verifyPermissionProfileAvailable();
+    await this.verifyMcpStatusReadback();
   }
 
   private async verifyPermissionProfileAvailable(): Promise<void> {
@@ -515,6 +670,134 @@ export class CodexAppServerPTY {
     }
   }
 
+  private async verifyMcpStatusReadback(
+    readinessTimeoutMs = MCP_STARTUP_TIMEOUT_MS,
+  ): Promise<void> {
+    await this.waitForMcpReadiness(readinessTimeoutMs);
+    await this.verifyMcpInventoryReadback();
+  }
+
+  private async waitForMcpReadiness(timeoutMs: number): Promise<void> {
+    if (this._mcpAllowlist.size === 0) return;
+    if (!this._alive) {
+      throw new PermissionProfileError('Codex app-server stopped before MCP startup completed');
+    }
+    if (this.allApprovedMcpServersReady()) return;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new PermissionProfileError('MCP startup timeout must be a positive finite duration');
+    }
+    if (this._mcpReadinessWaiter) {
+      throw new PermissionProfileError('MCP startup readiness is already being awaited');
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._mcpReadinessWaiter = null;
+        const pending = [...this._mcpAllowlist]
+          .filter((name) => this._mcpStartupStates.get(name) !== 'ready')
+          .sort()
+          .map((name) => `${name}=${this._mcpStartupStates.get(name) ?? 'pending'}`)
+          .join(', ');
+        reject(new PermissionProfileError(
+          `Timed out waiting for approved MCP servers to become ready: ${pending}`,
+        ));
+      }, timeoutMs);
+      this._mcpReadinessWaiter = {
+        resolve: () => {
+          clearTimeout(timer);
+          this._mcpReadinessWaiter = null;
+          resolve();
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          this._mcpReadinessWaiter = null;
+          reject(error);
+        },
+      };
+      this.settleMcpReadinessWaiter();
+    });
+  }
+
+  private allApprovedMcpServersReady(): boolean {
+    return [...this._mcpAllowlist]
+      .every((name) => this._mcpStartupStates.get(name) === 'ready');
+  }
+
+  private settleMcpReadinessWaiter(): void {
+    const waiter = this._mcpReadinessWaiter;
+    if (!waiter) return;
+    const failed = [...this._mcpAllowlist]
+      .find((name) => {
+        const status = this._mcpStartupStates.get(name);
+        return status === 'failed' || status === 'cancelled';
+      });
+    if (failed) {
+      waiter.reject(new PermissionProfileError(
+        `Approved MCP server ${failed} did not become available`,
+      ));
+    } else if (this.allApprovedMcpServersReady()) {
+      waiter.resolve();
+    }
+  }
+
+  private rejectMcpReadiness(error: Error): void {
+    this._mcpReadinessWaiter?.reject(error);
+  }
+
+  private async verifyMcpInventoryReadback(): Promise<void> {
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      pages += 1;
+      if (pages > 100) throw new PermissionProfileError('MCP status pagination exceeded its bound');
+      const response: JsonRpcResponse<McpServerStatusListResponse> =
+        await this.request<McpServerStatusListResponse>('mcpServerStatus/list', {
+        cursor,
+        limit: 100,
+        detail: 'toolsAndAuthOnly',
+      });
+      const result: McpServerStatusListResponse | undefined = response.result;
+      if (!result || !Array.isArray(result.data)) {
+        throw new PermissionProfileError('MCP status read-back had an invalid shape');
+      }
+      for (const entry of result.data) {
+        if (!isRecord(entry) || typeof entry.name !== 'string' || seen.has(entry.name)) {
+          throw new PermissionProfileError('MCP status read-back contained an invalid or duplicate name');
+        }
+        seen.add(entry.name);
+        const tools = isRecord(entry.tools) ? Object.keys(entry.tools) : null;
+        const resources = Array.isArray(entry.resources) ? entry.resources : null;
+        const templates = Array.isArray(entry.resourceTemplates) ? entry.resourceTemplates : null;
+        if (!tools || !resources || !templates || typeof entry.authStatus !== 'string') {
+          throw new PermissionProfileError(`MCP status read-back for ${entry.name} was malformed`);
+        }
+        if (this._mcpAllowlist.has(entry.name)) {
+          if (!isRecord(entry.serverInfo)) {
+            throw new PermissionProfileError(`Approved MCP server ${entry.name} is not active`);
+          }
+        } else if (
+          entry.serverInfo !== null
+          || tools.length !== 0
+          || resources.length !== 0
+          || templates.length !== 0
+        ) {
+          throw new PermissionProfileError(`Unapproved MCP server ${entry.name} is not inert`);
+        }
+      }
+      if (result.nextCursor !== null && typeof result.nextCursor !== 'string') {
+        throw new PermissionProfileError('MCP status read-back returned an invalid cursor');
+      }
+      cursor = result.nextCursor;
+    } while (cursor !== null);
+
+    for (const name of this._mcpAllowlist) {
+      if (!seen.has(name)) {
+        throw new PermissionProfileError(`Approved MCP server ${name} was absent from active read-back`);
+      }
+    }
+  }
+
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
     if (mode === 'continue') {
       const persisted = this.readThreadState();
@@ -525,11 +808,10 @@ export class CodexAppServerPTY {
             cwd: this._cwd,
             approvalPolicy: 'never',
             permissions: this._permissionProfileId,
-            config: { features: { goals: true } },
             excludeTurns: true,
             persistExtendedHistory: true,
           });
-          this.verifyActivePermissionProfile(resumed, 'thread/resume');
+          this.verifyEffectivePermissionProfile(resumed, 'thread/resume');
           this.setThreadId(resumed.result?.thread.id || persisted.threadId);
           return;
         } catch (err) {
@@ -545,11 +827,10 @@ export class CodexAppServerPTY {
           cwd: this._cwd,
           approvalPolicy: 'never',
           permissions: this._permissionProfileId,
-          config: { features: { goals: true } },
           excludeTurns: true,
           persistExtendedHistory: true,
         });
-        this.verifyActivePermissionProfile(resumed, 'thread/resume');
+        this.verifyEffectivePermissionProfile(resumed, 'thread/resume');
         this.setThreadId(resumed.result?.thread.id || latest);
         return;
       }
@@ -559,20 +840,79 @@ export class CodexAppServerPTY {
       cwd: this._cwd,
       approvalPolicy: 'never',
       permissions: this._permissionProfileId,
-      config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
-    this.verifyActivePermissionProfile(started, 'thread/start');
+    this.verifyEffectivePermissionProfile(started, 'thread/start');
     this.setThreadId(started.result!.thread.id);
   }
 
-  private verifyActivePermissionProfile(response: JsonRpcResponse<ThreadResponse>, method: string): void {
-    const actual = response.result?.activePermissionProfile?.id ?? null;
+  private verifyEffectivePermissionProfile(response: JsonRpcResponse<ThreadResponse>, method: string): void {
+    this.verifyEffectivePermissionState(
+      response.result?.activePermissionProfile,
+      response.result?.sandbox,
+      method,
+    );
+  }
+
+  private verifyEffectivePermissionState(
+    activeProfile: unknown,
+    sandboxValue: unknown,
+    method: string,
+  ): void {
+    const profile = isRecord(activeProfile) ? activeProfile : null;
+    const actual = typeof profile?.id === 'string' ? profile.id : null;
     if (actual !== this._permissionProfileId) {
       throw new PermissionProfileError(
         `${method} active permission profile mismatch: expected ${this._permissionProfileId}, got ${actual ?? 'none'}`,
+      );
+    }
+    const parent = typeof profile?.extends === 'string' ? profile.extends : null;
+    if (parent !== ':read-only') {
+      throw new PermissionProfileError(
+        `${method} active permission profile parent mismatch: expected :read-only, got ${parent ?? 'none'}`,
+      );
+    }
+
+    const sandbox = isRecord(sandboxValue) ? sandboxValue : null;
+    const expectedSandboxType = this._writablePaths.length > 0 ? 'workspaceWrite' : 'readOnly';
+    if (sandbox?.type !== expectedSandboxType) {
+      throw new PermissionProfileError(
+        `${method} sandbox type mismatch: expected ${expectedSandboxType}`,
+      );
+    }
+    const rawRoots = sandbox?.writableRoots;
+    if (expectedSandboxType === 'readOnly') {
+      if (rawRoots !== undefined && (!Array.isArray(rawRoots) || rawRoots.length !== 0)) {
+        throw new PermissionProfileError(`${method} returned writable roots for a read-only profile`);
+      }
+    } else if (!Array.isArray(rawRoots) || !rawRoots.every((path) => typeof path === 'string')) {
+      throw new PermissionProfileError(`${method} returned malformed writable roots`);
+    }
+    if (expectedSandboxType === 'workspaceWrite'
+      && (typeof sandbox?.excludeTmpdirEnvVar !== 'boolean' || sandbox?.excludeSlashTmp !== true)) {
+      throw new PermissionProfileError(`${method} ambient /tmp exclusion is not fail-closed`);
+    }
+    const cwd = canonicalizeExistingPath(this._cwd);
+    const configuredRoots = this._writablePaths.map(canonicalizeExistingPath);
+    const cwdIsDeclaredWritable = configuredRoots.includes(cwd);
+    const actualRoots = (Array.isArray(rawRoots) ? rawRoots : [])
+      .map(canonicalizeExistingPath)
+      .filter((path) => !(cwdIsDeclaredWritable && path === cwd));
+    // Codex represents a writable cwd as the implicit workspace root and omits
+    // it from writableRoots. Other declared roots remain explicit.
+    const expectedRoots = configuredRoots
+      .filter((path) => !(cwdIsDeclaredWritable && path === cwd));
+    if (!sameStringSet(actualRoots, expectedRoots)) {
+      throw new PermissionProfileError(
+        `${method} writable roots mismatch for ${this._permissionProfileId}`,
+      );
+    }
+    const expectedNetworkAccess = this._networkAllowDomains.length > 0;
+    if (sandbox?.networkAccess !== expectedNetworkAccess) {
+      throw new PermissionProfileError(
+        `${method} network access mismatch: expected ${expectedNetworkAccess}`,
       );
     }
   }
@@ -797,13 +1137,16 @@ export class CodexAppServerPTY {
         const threadId = typeof params.threadId === 'string' ? params.threadId : null;
         if (threadId === this._threadId) {
           const settings = isRecord(params.threadSettings) ? params.threadSettings : null;
-          const active = settings && isRecord(settings.activePermissionProfile)
-            ? settings.activePermissionProfile.id
-            : null;
-          if (active !== this._permissionProfileId) {
-            const error = new PermissionProfileError(
-              `thread/settings/updated active permission profile mismatch: expected ${this._permissionProfileId}, got ${typeof active === 'string' ? active : 'none'}`,
+          try {
+            this.verifyEffectivePermissionState(
+              settings?.activePermissionProfile,
+              settings?.sandboxPolicy,
+              'thread/settings/updated',
             );
+          } catch (cause) {
+            const error = cause instanceof Error
+              ? cause
+              : new PermissionProfileError('thread/settings/updated permission state is invalid');
             this._outputBuffer.push(`[codex-app-server] degraded: ${error.message}\n`);
             this.rejectTurnCompletion(error);
             this.kill();
@@ -823,8 +1166,54 @@ export class CodexAppServerPTY {
         this.appendCodexTokenLog(params);
         this._outputBuffer.push(`[codex-app-server:event] ${method}\n`);
         break;
+      case 'mcpServer/startupStatus/updated': {
+        const name = typeof params.name === 'string' ? params.name : null;
+        const status = typeof params.status === 'string' ? params.status : null;
+        if (!name || !this._mcpAllowlist.has(name)) {
+          const error = new PermissionProfileError(
+            `Unapproved MCP server ${name ?? '<missing>'} reported ${status ?? 'unknown'} startup state`,
+          );
+          this._outputBuffer.push(`[codex-app-server] degraded: ${error.message}\n`);
+          this.rejectTurnCompletion(error);
+          this.kill();
+          return;
+        }
+        if (status !== 'starting' && status !== 'ready' && status !== 'failed' && status !== 'cancelled') {
+          const error = new PermissionProfileError(
+            `Approved MCP server ${name} reported an invalid startup state`,
+          );
+          this._outputBuffer.push(`[codex-app-server] degraded: ${error.message}\n`);
+          this.rejectMcpReadiness(error);
+          this.rejectTurnCompletion(error);
+          this.kill();
+          return;
+        }
+        this._mcpStartupStates.set(name, status);
+        if (status === 'failed' || status === 'cancelled') {
+          const error = new PermissionProfileError(`Approved MCP server ${name} did not become available`);
+          this._outputBuffer.push(`[codex-app-server] degraded: ${error.message}\n`);
+          this.rejectMcpReadiness(error);
+          this.rejectTurnCompletion(error);
+          this.kill();
+          return;
+        }
+        this.settleMcpReadinessWaiter();
+        this._outputBuffer.push(`[codex-app-server:event] ${method} ${name} ${status ?? 'unknown'}\n`);
+        break;
+      }
+      case 'mcpServer/oauthLogin/completed': {
+        const name = typeof params.name === 'string' ? params.name : null;
+        if (!name || !this._mcpAllowlist.has(name)) {
+          const error = new PermissionProfileError('Unapproved MCP server attempted OAuth completion');
+          this._outputBuffer.push(`[codex-app-server] degraded: ${error.message}\n`);
+          this.rejectTurnCompletion(error);
+          this.kill();
+          return;
+        }
+        this._outputBuffer.push(`[codex-app-server:event] ${method} ${name}\n`);
+        break;
+      }
       case 'warning':
-      case 'mcpServer/startupStatus/updated':
       case 'account/rateLimits/updated':
       case 'skills/changed':
       case 'item/started':
@@ -1061,12 +1450,15 @@ export class CodexAppServerPTY {
   }
 
   private buildEnv(): Record<string, string> {
-    const env: Record<string, string> = {};
+    const env = this.buildBaseEnv();
 
-    const keepVars = ['PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL', 'TMPDIR'];
-    for (const key of keepVars) {
-      if (process.env[key]) env[key] = process.env[key]!;
-    }
+    // Codex workspaceWrite deliberately excludes the ambient TMPDIR and /tmp.
+    // Rebind all conventional temp variables to one explicit, private write
+    // root so ordinary tools retain scratch space without opening the agent's
+    // broader state/control directory.
+    env['TMPDIR'] = this._modelTempDir;
+    env['TMP'] = this._modelTempDir;
+    env['TEMP'] = this._modelTempDir;
 
     env['CTX_INSTANCE_ID'] = this._env.instanceId;
     env['CTX_ROOT'] = this._env.ctxRoot;
@@ -1090,6 +1482,47 @@ export class CodexAppServerPTY {
     return env;
   }
 
+  private preparePrivateModelTempDir(): void {
+    ensureDir(this._stateDir);
+    const stateStat = lstatSync(this._stateDir);
+    if (stateStat.isSymbolicLink() || !stateStat.isDirectory()) {
+      throw new PermissionProfileError('Codex agent state directory must be a real directory');
+    }
+    chmodSync(this._stateDir, 0o700);
+
+    if (existsSync(this._modelTempDir)) {
+      const tempStat = lstatSync(this._modelTempDir);
+      if (tempStat.isSymbolicLink() || !tempStat.isDirectory()) {
+        throw new PermissionProfileError('Codex model temporary path must be a real directory');
+      }
+      // A prior unclean exit may leave model-created scratch data behind.
+      // The seat is single-process; clear it before granting the new process.
+      rmSync(this._modelTempDir, { recursive: true, force: false });
+    }
+    mkdirSync(this._modelTempDir, { recursive: false, mode: 0o700 });
+    chmodSync(this._modelTempDir, 0o700);
+  }
+
+  private cleanupPrivateModelTempDir(): void {
+    try {
+      if (!existsSync(this._modelTempDir)) return;
+      const stat = lstatSync(this._modelTempDir);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return;
+      rmSync(this._modelTempDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort on process shutdown. The next spawn rejects unsafe path
+      // types and clears a valid stale directory before reuse.
+    }
+  }
+
+  private buildBaseEnv(): Record<string, string> {
+    const env: Record<string, string> = {};
+    for (const key of BASE_ENV_VARS) {
+      if (process.env[key]) env[key] = process.env[key]!;
+    }
+    return env;
+  }
+
   private loadEnvFile(path: string, env: Record<string, string>): void {
     if (!existsSync(path)) return;
     try {
@@ -1098,12 +1531,67 @@ export class CodexAppServerPTY {
         if (!trimmed || trimmed.startsWith('#')) continue;
         const eqIdx = trimmed.indexOf('=');
         if (eqIdx > 0) {
-          env[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+          const name = trimmed.slice(0, eqIdx).trim();
+          if (this._envAllowlist.has(name)) {
+            env[name] = trimmed.slice(eqIdx + 1).trim();
+          }
         }
       }
     } catch {
       // Ignore env file read errors.
     }
+  }
+
+  private buildMcpConfigArgs(): string[] {
+    const result = spawnSync('codex', [
+      ...EXTERNAL_FEATURES_DISABLED_FOR_FLEET.flatMap((feature) => ['--disable', feature]),
+      'mcp',
+      'list',
+      '--json',
+    ], {
+      env: this.buildBaseEnv(),
+      cwd: this._cwd,
+      encoding: 'utf-8',
+      maxBuffer: 1024 * 1024,
+      timeout: 10_000,
+    });
+    if (result.error || result.status !== 0 || typeof result.stdout !== 'string') {
+      throw new PermissionProfileError('Unable to enumerate configured Codex MCP servers safely');
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(result.stdout);
+    } catch {
+      throw new PermissionProfileError('Configured Codex MCP inventory was not valid JSON');
+    }
+    if (!Array.isArray(parsed)) {
+      throw new PermissionProfileError('Configured Codex MCP inventory had an invalid shape');
+    }
+
+    const configured = new Map<string, boolean>();
+    for (const entry of parsed) {
+      if (!isRecord(entry) || typeof entry.name !== 'string' || typeof entry.enabled !== 'boolean') {
+        throw new PermissionProfileError('Configured Codex MCP inventory had an invalid entry');
+      }
+      const name = validateMcpName(entry.name, 'configured MCP server name');
+      if (configured.has(name)) {
+        throw new PermissionProfileError('Configured Codex MCP inventory contained a duplicate name');
+      }
+      configured.set(name, entry.enabled);
+    }
+
+    for (const name of this._mcpAllowlist) {
+      if (configured.get(name) !== true) {
+        throw new PermissionProfileError(`Approved MCP server ${name} is not configured and enabled`);
+      }
+    }
+    const disabled = [...configured.keys()].filter((name) => !this._mcpAllowlist.has(name)).sort();
+    if (disabled.length === 0) return [];
+    const inlineServers = disabled
+      .map((name) => `${tomlString(name)}={enabled=false}`)
+      .join(',');
+    return ['-c', `mcp_servers={${inlineServers}}`];
   }
 
   private getPackageVersion(): string {
@@ -1128,6 +1616,156 @@ function validateCredentialDenyPaths(paths: string[] | undefined): string[] {
   return [...new Set(normalized)];
 }
 
+export function compileCodexCapabilityPolicy(
+  config: AgentConfig,
+  modelTempDir: string,
+  socketPath: string,
+): {
+  credentialDenyPaths: string[];
+  writablePaths: string[];
+  readonlyPaths: string[];
+  networkAllowDomains: string[];
+  envAllowlist: string[];
+  mcpAllowlist: string[];
+  profile: { id: string; configArgs: string[] };
+} {
+  const credentialDenyPaths = validateCredentialDenyPaths(config.codex_credential_deny_paths);
+  assertSensitivePathsHaveNoAliases(credentialDenyPaths, 'codex_credential_deny_paths');
+  const writablePaths = [...new Set([
+    ...validateWritablePaths(config.codex_writable_paths),
+    validateAbsolutePolicyPath(modelTempDir, 'Codex model temporary directory'),
+  ])].sort();
+  const readonlyPaths = validateReadonlyPaths(config.codex_readonly_paths);
+  assertSensitivePathsHaveNoAliases(readonlyPaths, 'codex_readonly_paths');
+  const networkAllowDomains = validateNetworkAllowDomains(config.codex_network_allow_domains);
+  const envAllowlist = validateEnvAllowlist(config.codex_env_allowlist);
+  const mcpAllowlist = validateMcpAllowlist(config.codex_mcp_allowlist);
+  const profile = buildPermissionProfile(
+    credentialDenyPaths,
+    writablePaths,
+    readonlyPaths,
+    networkAllowDomains,
+    socketPath,
+  );
+  return {
+    credentialDenyPaths,
+    writablePaths,
+    readonlyPaths,
+    networkAllowDomains,
+    envAllowlist,
+    mcpAllowlist,
+    profile,
+  };
+}
+
+function assertSensitivePathsHaveNoAliases(
+  paths: string[],
+  policyField: 'codex_credential_deny_paths' | 'codex_readonly_paths',
+): void {
+  const maximumEntries = 10_000;
+  let entries = 0;
+  const inspect = (path: string): void => {
+    if (!existsSync(path)) return;
+    entries += 1;
+    if (entries > maximumEntries) {
+      throw new Error(`${policyField} exceeded the bounded inode audit`);
+    }
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`${policyField} must not contain symbolic links`);
+    }
+    if (stat.isFile()) {
+      if (stat.nlink !== 1) {
+        throw new Error(
+          `${policyField} contains a hard-linked file; every protected inode must have exactly one name before launch`,
+        );
+      }
+      return;
+    }
+    if (stat.isDirectory()) {
+      for (const name of readdirSync(path)) inspect(join(path, name));
+      return;
+    }
+    throw new Error(`${policyField} must contain only regular files or directories`);
+  };
+  for (const path of paths) inspect(path);
+}
+
+function validateWritablePaths(paths: string[] | undefined): string[] {
+  if (!Array.isArray(paths)) {
+    throw new Error('codex_writable_paths must be an explicit array of normalized absolute paths');
+  }
+  return [...new Set(paths.map((path, index) => validateAbsolutePolicyPath(
+    path,
+    `codex_writable_paths[${index}]`,
+  )))].sort();
+}
+
+function validateReadonlyPaths(paths: string[] | undefined): string[] {
+  if (!Array.isArray(paths)) {
+    throw new Error('codex_readonly_paths must be an explicit array of normalized absolute paths');
+  }
+  return [...new Set(paths.map((path, index) => validateAbsolutePolicyPath(
+    path,
+    `codex_readonly_paths[${index}]`,
+  )))].sort();
+}
+
+function validateNetworkAllowDomains(domains: string[] | undefined): string[] {
+  if (!Array.isArray(domains)) {
+    throw new Error('codex_network_allow_domains must be an explicit array');
+  }
+  if (domains.length > 0) {
+    throw new Error(
+      'codex_network_allow_domains must remain empty: Codex 0.144.2 exposes only a networkAccess boolean and does not provide enforcement-grade exact-domain read-back',
+    );
+  }
+  return [];
+}
+
+function validateEnvAllowlist(names: string[] | undefined): string[] {
+  if (!Array.isArray(names)) {
+    throw new Error('codex_env_allowlist must be an explicit array');
+  }
+  const validated = names.map((name, index) => {
+    if (
+      typeof name !== 'string'
+      || !/^[A-Z_][A-Z0-9_]*$/.test(name)
+      || name.startsWith('CTX_')
+      || name.startsWith('DYLD_')
+      || name.startsWith('LD_')
+      || RESERVED_ENV_VARS.has(name)
+    ) {
+      throw new Error(`codex_env_allowlist[${index}] is not an allowed environment-variable name`);
+    }
+    return name;
+  });
+  return [...new Set(validated)].sort();
+}
+
+function validateMcpAllowlist(names: string[] | undefined): string[] {
+  if (!Array.isArray(names)) {
+    throw new Error('codex_mcp_allowlist must be an explicit array');
+  }
+  return [...new Set(names.map((name, index) => validateMcpName(
+    name,
+    `codex_mcp_allowlist[${index}]`,
+  )))].sort();
+}
+
+function validateMcpName(name: unknown, label: string): string {
+  if (
+    typeof name !== 'string'
+    || name.length === 0
+    || name.length > 128
+    || name.trim() !== name
+    || /[\0-\x1f\x7f]/.test(name)
+  ) {
+    throw new Error(`${label} must be a non-empty normalized MCP server name`);
+  }
+  return name;
+}
+
 function validateAbsolutePolicyPath(path: unknown, label: string): string {
   if (
     typeof path !== 'string'
@@ -1144,24 +1782,122 @@ function validateAbsolutePolicyPath(path: unknown, label: string): string {
 
 function buildPermissionProfile(
   credentialDenyPaths: string[],
+  writablePaths: string[],
+  readonlyPaths: string[],
+  networkAllowDomains: string[],
   socketPath: string,
 ): { id: string; configArgs: string[] } {
   const exactSocketPath = validateAbsolutePolicyPath(socketPath, 'Codex app-server control socket');
   const denyPaths = [...new Set([...credentialDenyPaths, exactSocketPath])].sort();
+  assertFilesystemPrivilegeLattice(denyPaths, readonlyPaths, writablePaths);
+  assertSensitivePathsCannotBeRelocated(denyPaths, readonlyPaths, writablePaths);
   const id = `${PERMISSION_PROFILE_PREFIX}-${randomBytes(8).toString('hex')}`;
   const prefix = `permissions.${id}`;
+  const filesystemPolicy = [
+    ...writablePaths.map((path) => [path, 'write'] as const),
+    ...readonlyPaths.map((path) => [path, 'read'] as const),
+    ...denyPaths.map((path) => [path, 'deny'] as const),
+  ].sort(([left], [right]) => left.localeCompare(right));
+  const domainPolicy = networkAllowDomains.map((domain) => [domain, 'allow'] as const);
   const overrides = [
-    `${prefix}.description=${tomlString('cortextOS fleet workspace with credential isolation')}`,
-    `${prefix}.extends=${tomlString(':workspace')}`,
-    `${prefix}.network.enabled=true`,
-    `${prefix}.network.domains.${tomlString('*')}=${tomlString('allow')}`,
-    `${prefix}.network.unix_sockets.${tomlString(exactSocketPath)}=${tomlString('deny')}`,
-    ...denyPaths.map((path) => `${prefix}.filesystem.${tomlString(path)}=${tomlString('deny')}`),
+    `${prefix}.description=${tomlString('cortextOS fleet role workspace with isolated control plane')}`,
+    `${prefix}.extends=${tomlString(':read-only')}`,
+    `${prefix}.filesystem=${tomlStringMap(filesystemPolicy)}`,
+    `${prefix}.network.enabled=${networkAllowDomains.length > 0}`,
+    ...(domainPolicy.length > 0 ? [`${prefix}.network.domains=${tomlStringMap(domainPolicy)}`] : []),
+    `${prefix}.network.unix_sockets=${tomlStringMap([[exactSocketPath, 'deny']])}`,
   ];
   return {
     id,
     configArgs: overrides.flatMap((override) => ['-c', override]),
   };
+}
+
+function canonicalizePolicyPath(path: string): string {
+  let cursor = path;
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      return normalize(join(realpathSync(cursor), ...suffix.reverse()));
+    } catch {
+      const parent = dirname(cursor);
+      if (parent === cursor) return path;
+      suffix.push(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+function isSameOrDescendant(candidate: string, ancestor: string): boolean {
+  const rel = relative(ancestor, candidate);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+}
+
+function privilegeReopensPath(candidate: string, stronger: string): boolean {
+  return isSameOrDescendant(candidate, stronger)
+    || isSameOrDescendant(canonicalizePolicyPath(candidate), canonicalizePolicyPath(stronger));
+}
+
+function assertFilesystemPrivilegeLattice(
+  denyPaths: string[],
+  readonlyPaths: string[],
+  writablePaths: string[],
+): void {
+  for (const path of [...readonlyPaths, ...writablePaths]) {
+    if (denyPaths.some((denied) => privilegeReopensPath(path, denied))) {
+      throw new Error(
+        'Codex readable or writable capability paths must not equal or descend from a credential or control-socket deny path',
+      );
+    }
+  }
+  for (const writable of writablePaths) {
+    if (readonlyPaths.some((readonly) => privilegeReopensPath(writable, readonly))) {
+      throw new Error(
+        'codex_writable_paths must not equal or descend from codex_readonly_paths',
+      );
+    }
+  }
+}
+
+function assertSensitivePathsCannotBeRelocated(
+  denyPaths: string[],
+  readonlyPaths: string[],
+  writablePaths: string[],
+): void {
+  for (const sensitive of [...denyPaths, ...readonlyPaths]) {
+    for (const writable of writablePaths) {
+      for (const [candidate, root] of [
+        [sensitive, writable],
+        [canonicalizePolicyPath(sensitive), canonicalizePolicyPath(writable)],
+      ] as const) {
+        if (!isSameOrDescendant(candidate, root) || candidate === root) continue;
+        const segments = relative(root, candidate).split(sep).filter(Boolean);
+        if (segments.length > 1) {
+          throw new Error(
+            'Codex deny/read-only paths may be direct children of a writable root but must not sit below a renameable writable intermediate directory',
+          );
+        }
+      }
+    }
+  }
+}
+
+function tomlStringMap(entries: ReadonlyArray<readonly [string, string]>): string {
+  return `{${entries.map(([key, value]) => `${tomlString(key)}=${tomlString(value)}`).join(',')}}`;
+}
+
+function canonicalizeExistingPath(path: string): string {
+  try {
+    return require('fs').realpathSync(path) as string;
+  } catch {
+    return path;
+  }
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  const a = [...new Set(left)].sort();
+  const b = [...new Set(right)].sort();
+  return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
 function tomlString(value: string): string {

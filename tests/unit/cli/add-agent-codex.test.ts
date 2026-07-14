@@ -109,6 +109,24 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(cfg.runtime).toBe('codex-app-server');
     expect(cfg.model).toBe('gpt-5-codex');
     expect(cfg.agent_name).toBe('codex-cfg');
+    const agentDir = join(tempRoot, 'orgs', 'testorg', 'agents', 'codex-cfg');
+    expect(cfg.codex_credential_deny_paths).toEqual([
+      join(agentDir, '.env'),
+      join(tempRoot, 'orgs', 'testorg', 'secrets.env'),
+      join(tempHome, '.codex', 'auth.json'),
+      join(tempHome, '.codex', 'config.toml'),
+    ]);
+    expect(cfg.codex_writable_paths).toEqual([agentDir]);
+    expect(cfg.codex_readonly_paths).toEqual(expect.arrayContaining([
+      join(agentDir, 'AGENTS.md'),
+      join(agentDir, 'IDENTITY.md'),
+      join(agentDir, 'SYSTEM.md'),
+      join(agentDir, 'config.json'),
+      join(agentDir, 'goals.json'),
+    ]));
+    expect(cfg.codex_network_allow_domains).toEqual([]);
+    expect(cfg.codex_env_allowlist).toEqual([]);
+    expect(cfg.codex_mcp_allowlist).toEqual([]);
   });
 
   it('copies the 23 codex skills into plugins/cortextos-agent-skills/skills', async () => {

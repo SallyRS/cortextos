@@ -6,6 +6,11 @@ const fsMocks = {
   writeFileSync: vi.fn(),
   unlinkSync: vi.fn(),
   appendFileSync: vi.fn(),
+  chmodSync: vi.fn(),
+  lstatSync: vi.fn(),
+  mkdirSync: vi.fn(),
+  readdirSync: vi.fn(),
+  rmSync: vi.fn(),
 };
 
 vi.mock('fs', async () => {
@@ -17,14 +22,24 @@ vi.mock('fs', async () => {
     get writeFileSync() { return fsMocks.writeFileSync; },
     get unlinkSync() { return fsMocks.unlinkSync; },
     get appendFileSync() { return fsMocks.appendFileSync; },
+    get chmodSync() { return fsMocks.chmodSync; },
+    get lstatSync() { return fsMocks.lstatSync; },
+    get mkdirSync() { return fsMocks.mkdirSync; },
+    get readdirSync() { return fsMocks.readdirSync; },
+    get rmSync() { return fsMocks.rmSync; },
   };
 });
 
 const atomicWriteSyncMock = vi.fn();
+const spawnSyncMock = vi.fn();
 
 vi.mock('../../../src/utils/atomic.js', () => ({
   ensureDir: vi.fn(),
   atomicWriteSync: atomicWriteSyncMock,
+}));
+
+vi.mock('child_process', () => ({
+  spawnSync: spawnSyncMock,
 }));
 
 vi.mock('node-pty', () => ({
@@ -79,10 +94,36 @@ const mockEnv = {
 const credentialSecretPath = '/tmp/command-center/brain/.env';
 const secureConfig = {
   codex_credential_deny_paths: [credentialSecretPath],
+  codex_writable_paths: ['/tmp/fw/role-work'],
+  codex_readonly_paths: ['/tmp/fw/role-work/AGENTS.md'],
+  codex_network_allow_domains: [],
+  codex_env_allowlist: ['CC_AGENT_ACTION_TOKEN'],
+  codex_mcp_allowlist: [],
 };
 
 function permissionProfileId(pty: InstanceType<typeof CodexAppServerPTY>): string {
   return (pty as unknown as { _permissionProfileId: string })._permissionProfileId;
+}
+
+function effectiveWritablePaths(pty: InstanceType<typeof CodexAppServerPTY>): string[] {
+  return (pty as unknown as { _writablePaths: string[] })._writablePaths;
+}
+
+function safeThreadResult(
+  pty: InstanceType<typeof CodexAppServerPTY>,
+  threadId: string,
+) {
+  return {
+    thread: { id: threadId },
+    activePermissionProfile: { id: permissionProfileId(pty), extends: ':read-only' },
+    sandbox: {
+      type: 'workspaceWrite',
+      writableRoots: effectiveWritablePaths(pty),
+      networkAccess: false,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: true,
+    },
+  };
 }
 
 beforeEach(() => {
@@ -91,16 +132,99 @@ beforeEach(() => {
   fsMocks.writeFileSync.mockReset();
   fsMocks.unlinkSync.mockReset();
   fsMocks.appendFileSync.mockReset();
+  fsMocks.chmodSync.mockReset();
+  fsMocks.lstatSync.mockReset().mockReturnValue({
+    isSymbolicLink: () => false,
+    isDirectory: () => true,
+    isFile: () => false,
+    nlink: 1,
+  });
+  fsMocks.mkdirSync.mockReset();
+  fsMocks.readdirSync.mockReset().mockReturnValue([]);
+  fsMocks.rmSync.mockReset();
   requestMock.mockReset();
   notifyMock.mockReset();
   closeMock.mockReset();
   respondErrorMock.mockReset();
   logEventMock.mockReset();
   atomicWriteSyncMock.mockReset();
+  spawnSyncMock.mockReset().mockReturnValue({
+    status: 0,
+    stdout: '[]',
+    stderr: '',
+    error: undefined,
+  });
   messageHandler = null;
 });
 
 describe('CodexAppServerPTY socket path policy', () => {
+  it('does not launch a replacement app-server after kill cancels retry backoff', async () => {
+    vi.useFakeTimers();
+    let start: ReturnType<typeof vi.spyOn> | null = null;
+    try {
+      const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+      const internals = pty as unknown as {
+        _alive: boolean;
+        startAppServer(): Promise<void>;
+        startAppServerWithRetry(): Promise<void>;
+      };
+      internals._alive = true;
+      start = vi.spyOn(internals, 'startAppServer')
+        .mockRejectedValueOnce(new Error('first attempt failed'))
+        .mockResolvedValue(undefined);
+
+      const retry = internals.startAppServerWithRetry();
+      const result = retry.then(
+        () => null,
+        (err: unknown) => err as Error,
+      );
+      await Promise.resolve();
+      pty.kill();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect((await result)?.message).toMatch(/startup was cancelled/);
+      expect(start).toHaveBeenCalledOnce();
+    } finally {
+      start?.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still retries an unexpected app-server exit that was not an operator cancellation', async () => {
+    vi.useFakeTimers();
+    let start: ReturnType<typeof vi.spyOn> | null = null;
+    let prepareTemp: ReturnType<typeof vi.spyOn> | null = null;
+    try {
+      const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+      const internals = pty as unknown as {
+        _alive: boolean;
+        preparePrivateModelTempDir(): void;
+        startAppServer(): Promise<void>;
+        startAppServerWithRetry(): Promise<void>;
+      };
+      internals._alive = true;
+      prepareTemp = vi.spyOn(internals, 'preparePrivateModelTempDir');
+      start = vi.spyOn(internals, 'startAppServer')
+        .mockImplementationOnce(async () => {
+          internals._alive = false;
+          throw new Error('child exited');
+        })
+        .mockResolvedValue(undefined);
+
+      const retry = internals.startAppServerWithRetry();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(retry).resolves.toBeUndefined();
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(prepareTemp).toHaveBeenCalledTimes(2);
+    } finally {
+      prepareTemp?.mockRestore();
+      start?.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('uses codex.sock in the agent state dir by default', () => {
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     expect((pty as unknown as { _socketPath: string })._socketPath).toBe('/tmp/ctx/state/codex-app-agent/codex.sock');
@@ -125,16 +249,30 @@ describe('CodexAppServerPTY socket path policy', () => {
       expect.stringContaining('"fallback": true'),
       'utf-8',
     );
+    expect(overrides.find((value) => value.startsWith(`permissions.${profileId}.filesystem=`)))
+      .toContain(`${JSON.stringify(socketPath)}=\"deny\"`);
     expect(overrides).toContain(
-      `permissions.${profileId}.filesystem.${JSON.stringify(socketPath)}=\"deny\"`,
-    );
-    expect(overrides).toContain(
-      `permissions.${profileId}.network.unix_sockets.${JSON.stringify(socketPath)}=\"deny\"`,
+      `permissions.${profileId}.network.unix_sockets={${JSON.stringify(socketPath)}=\"deny\"}`,
     );
   });
 });
 
 describe('CodexAppServerPTY permission profile policy', () => {
+  it('rejects a hard-linked read-only control file before RPC setup', () => {
+    const readonlyPath = secureConfig.codex_readonly_paths[0];
+    fsMocks.existsSync.mockImplementation((path) => path === readonlyPath);
+    fsMocks.lstatSync.mockReturnValue({
+      isSymbolicLink: () => false,
+      isDirectory: () => false,
+      isFile: () => true,
+      nlink: 2,
+    });
+
+    expect(() => new CodexAppServerPTY(mockEnv, secureConfig))
+      .toThrow(/codex_readonly_paths contains a hard-linked file/);
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
   it.each([
     undefined,
     [],
@@ -151,7 +289,53 @@ describe('CodexAppServerPTY permission profile policy', () => {
     expect(requestMock).not.toHaveBeenCalled();
   });
 
-  it('compiles a unique named workspace profile with exact secret and control-socket denies', () => {
+  it.each([
+    [{ ...secureConfig, codex_writable_paths: undefined }, /codex_writable_paths/],
+    [{ ...secureConfig, codex_writable_paths: ['relative'] }, /codex_writable_paths/],
+    [{
+      ...secureConfig,
+      codex_credential_deny_paths: ['/tmp/denied'],
+      codex_writable_paths: ['/tmp/denied/child'],
+    }, /must not equal or descend/],
+    [{ ...secureConfig, codex_readonly_paths: undefined }, /codex_readonly_paths/],
+    [{ ...secureConfig, codex_readonly_paths: ['relative'] }, /codex_readonly_paths/],
+    [{
+      ...secureConfig,
+      codex_credential_deny_paths: ['/tmp/denied'],
+      codex_readonly_paths: ['/tmp/denied/child'],
+    }, /must not equal or descend/],
+    [{
+      ...secureConfig,
+      codex_readonly_paths: ['/tmp/role-policy'],
+      codex_writable_paths: ['/tmp/role-policy/output'],
+    }, /must not equal or descend/],
+    [{
+      ...secureConfig,
+      codex_writable_paths: ['/tmp/role-work'],
+      codex_readonly_paths: ['/tmp/role-work/nested/AGENTS.md'],
+    }, /renameable writable intermediate/],
+    [{
+      ...secureConfig,
+      codex_credential_deny_paths: ['/tmp/role-work/nested/secret.env'],
+      codex_writable_paths: ['/tmp/role-work'],
+      codex_readonly_paths: [],
+    }, /renameable writable intermediate/],
+    [{ ...secureConfig, codex_network_allow_domains: undefined }, /codex_network_allow_domains/],
+    [{ ...secureConfig, codex_network_allow_domains: ['*'] }, /codex_network_allow_domains/],
+    [{ ...secureConfig, codex_network_allow_domains: ['127.0.0.1:8091'] }, /must remain empty/],
+    [{ ...secureConfig, codex_env_allowlist: undefined }, /codex_env_allowlist/],
+    [{ ...secureConfig, codex_env_allowlist: ['PATH'] }, /codex_env_allowlist/],
+    [{ ...secureConfig, codex_env_allowlist: ['CTX_ROOT'] }, /codex_env_allowlist/],
+    [{ ...secureConfig, codex_env_allowlist: ['DYLD_INSERT_LIBRARIES'] }, /codex_env_allowlist/],
+    [{ ...secureConfig, codex_env_allowlist: ['NODE_OPTIONS'] }, /codex_env_allowlist/],
+    [{ ...secureConfig, codex_env_allowlist: ['HTTPS_PROXY'] }, /codex_env_allowlist/],
+    [{ ...secureConfig, codex_mcp_allowlist: undefined }, /codex_mcp_allowlist/],
+    [{ ...secureConfig, codex_mcp_allowlist: [' bad '] }, /codex_mcp_allowlist/],
+  ])('rejects malformed explicit role capability policy: %j', (config, expected) => {
+    expect(() => new CodexAppServerPTY(mockEnv, config)).toThrow(expected);
+  });
+
+  it('compiles a unique read-only-base profile with broad role-work writes and exact control-plane denies', () => {
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const secondPty = new CodexAppServerPTY(mockEnv, secureConfig);
     const profileId = permissionProfileId(pty);
@@ -161,12 +345,21 @@ describe('CodexAppServerPTY permission profile policy', () => {
 
     expect(profileId).toMatch(/^cortextos-fleet-[a-f0-9]{16}$/);
     expect(permissionProfileId(secondPty)).not.toBe(profileId);
-    expect(overrides).toContain(`permissions.${profileId}.extends=\":workspace\"`);
-    expect(overrides).toContain(`permissions.${profileId}.filesystem.${JSON.stringify(credentialSecretPath)}=\"deny\"`);
-    expect(overrides).toContain(`permissions.${profileId}.filesystem.${JSON.stringify(socketPath)}=\"deny\"`);
-    expect(overrides).toContain(`permissions.${profileId}.network.unix_sockets.${JSON.stringify(socketPath)}=\"deny\"`);
-    expect(overrides).toContain(`permissions.${profileId}.network.enabled=true`);
-    expect(overrides).toContain(`permissions.${profileId}.network.domains.\"*\"=\"allow\"`);
+    expect(overrides).toContain(`permissions.${profileId}.extends=\":read-only\"`);
+    const filesystem = overrides.find((value) => value.startsWith(`permissions.${profileId}.filesystem=`));
+    expect(filesystem).toContain(`${JSON.stringify(credentialSecretPath)}=\"deny\"`);
+    expect(filesystem).toContain(`${JSON.stringify(socketPath)}=\"deny\"`);
+    expect(filesystem).toContain(`${JSON.stringify('/tmp/fw/role-work')}=\"write\"`);
+    expect(filesystem).toContain(`${JSON.stringify('/tmp/ctx/state/codex-app-agent/model-tmp')}=\"write\"`);
+    expect(filesystem).toContain(`${JSON.stringify('/tmp/fw/role-work/AGENTS.md')}=\"read\"`);
+    expect(overrides).toContain(
+      `permissions.${profileId}.network.unix_sockets={${JSON.stringify(socketPath)}=\"deny\"}`,
+    );
+    expect(overrides).toContain(`permissions.${profileId}.network.enabled=false`);
+    expect(overrides.some((value) => value.startsWith(
+      `permissions.${profileId}.network.domains=`,
+    ))).toBe(false);
+    expect(JSON.stringify(args)).not.toContain('*');
     expect(JSON.stringify(args)).not.toMatch(/danger-full-access|dangerFullAccess|sandbox_mode/);
   });
 
@@ -194,7 +387,159 @@ describe('CodexAppServerPTY permission profile policy', () => {
     });
   });
 
+  it('verifies paginated active MCP status and accepts only inert unapproved placeholders', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    requestMock
+      .mockResolvedValueOnce({ result: {
+        data: [{
+          name: 'ambient-one', serverInfo: null, tools: {}, resources: [],
+          resourceTemplates: [], authStatus: 'unsupported',
+        }],
+        nextCursor: 'page-2',
+      } })
+      .mockResolvedValueOnce({ result: {
+        data: [{
+          name: 'ambient-two', serverInfo: null, tools: {}, resources: [],
+          resourceTemplates: [], authStatus: 'unsupported',
+        }],
+        nextCursor: null,
+      } });
+
+    await expect((pty as unknown as { verifyMcpStatusReadback(): Promise<void> })
+      .verifyMcpStatusReadback()).resolves.toBeUndefined();
+    expect(requestMock).toHaveBeenNthCalledWith(2, 'mcpServerStatus/list', {
+      cursor: 'page-2', limit: 100, detail: 'toolsAndAuthOnly',
+    });
+  });
+
+  it('waits for an approved MCP to move from starting to ready before paginated inventory read-back', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    requestMock
+      .mockResolvedValueOnce({ result: {
+        data: [{
+          name: 'ambient', serverInfo: null, tools: {}, resources: [],
+          resourceTemplates: [], authStatus: 'unsupported',
+        }],
+        nextCursor: 'page-2',
+      } })
+      .mockResolvedValueOnce({ result: {
+        data: [{
+          name: 'approved-role-server', serverInfo: { name: 'approved-role-server' },
+          tools: { read: {} }, resources: [], resourceTemplates: [], authStatus: 'notRequired',
+        }],
+        nextCursor: null,
+      } });
+    const internals = pty as unknown as {
+      _alive: boolean;
+      verifyMcpStatusReadback(timeoutMs?: number): Promise<void>;
+      handleRpcMessage(message: unknown): void;
+    };
+    internals._alive = true;
+
+    const verification = internals.verifyMcpStatusReadback(1_000);
+    internals.handleRpcMessage({
+      method: 'mcpServer/startupStatus/updated',
+      params: { name: 'approved-role-server', status: 'starting' },
+    });
+    await Promise.resolve();
+    expect(requestMock).not.toHaveBeenCalled();
+
+    internals.handleRpcMessage({
+      method: 'mcpServer/startupStatus/updated',
+      params: { name: 'approved-role-server', status: 'ready' },
+    });
+    await expect(verification).resolves.toBeUndefined();
+    expect(requestMock).toHaveBeenNthCalledWith(2, 'mcpServerStatus/list', {
+      cursor: 'page-2', limit: 100, detail: 'toolsAndAuthOnly',
+    });
+  });
+
+  it.each(['failed', 'cancelled'] as const)(
+    'fails readiness immediately when an approved MCP reports %s',
+    async (status) => {
+      const pty = new CodexAppServerPTY(mockEnv, {
+        ...secureConfig,
+        codex_mcp_allowlist: ['approved-role-server'],
+      });
+      const internals = pty as unknown as {
+        _alive: boolean;
+        verifyMcpStatusReadback(timeoutMs?: number): Promise<void>;
+        handleRpcMessage(message: unknown): void;
+      };
+      internals._alive = true;
+
+      const verification = internals.verifyMcpStatusReadback(10_000);
+      internals.handleRpcMessage({
+        method: 'mcpServer/startupStatus/updated',
+        params: { name: 'approved-role-server', status },
+      });
+
+      await expect(verification).rejects.toThrow(/did not become available/);
+      expect(requestMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('fails readiness on a bounded timeout without reading a premature inventory', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+    (pty as unknown as { _alive: boolean })._alive = true;
+
+    await expect((pty as unknown as {
+      verifyMcpStatusReadback(timeoutMs?: number): Promise<void>;
+    }).verifyMcpStatusReadback(5)).rejects.toThrow(
+      /Timed out waiting for approved MCP servers to become ready: approved-role-server=pending/,
+    );
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
+  it('fails active read-back for a capable ambient MCP or an inactive approved MCP', async () => {
+    const ambient = new CodexAppServerPTY(mockEnv, secureConfig);
+    (ambient as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    requestMock.mockResolvedValue({ result: {
+      data: [{
+        name: 'ambient', serverInfo: { name: 'ambient' }, tools: { send: {} },
+        resources: [], resourceTemplates: [], authStatus: 'bearerToken',
+      }],
+      nextCursor: null,
+    } });
+    await expect((ambient as unknown as { verifyMcpStatusReadback(): Promise<void> })
+      .verifyMcpStatusReadback()).rejects.toThrow(/not inert/);
+
+    requestMock.mockReset().mockResolvedValue({ result: {
+      data: [{
+        name: 'approved-role-server', serverInfo: null, tools: {},
+        resources: [], resourceTemplates: [], authStatus: 'unsupported',
+      }],
+      nextCursor: null,
+    } });
+    const approved = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+    (approved as unknown as { _alive: boolean })._alive = true;
+    (approved as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    (approved as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'mcpServer/startupStatus/updated',
+      params: { name: 'approved-role-server', status: 'ready' },
+    });
+    await expect((approved as unknown as { verifyMcpStatusReadback(): Promise<void> })
+      .verifyMcpStatusReadback()).rejects.toThrow(/not active/);
+  });
+
   it('spawns app-server with strict generated config and no danger override', async () => {
+    spawnSyncMock.mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify([{ name: 'ambient-host-server', enabled: true }]),
+      stderr: '',
+      error: undefined,
+    });
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const spawn = vi.fn().mockReturnValue({
       pid: 88,
@@ -204,14 +549,161 @@ describe('CodexAppServerPTY permission profile policy', () => {
       kill: vi.fn(),
     });
     (pty as unknown as { _spawnFn: typeof spawn })._spawnFn = spawn;
+    (pty as unknown as { _alive: boolean })._alive = true;
     fsMocks.existsSync.mockReturnValue(true);
 
     await (pty as unknown as { startAppServer(): Promise<void> }).startAppServer();
 
     const args = spawn.mock.calls[0][1] as string[];
     expect(args).toContain('--strict-config');
+    for (const feature of ['apps', 'plugins', 'browser_use', 'computer_use', 'in_app_browser', 'image_generation']) {
+      expect(args).toContain(feature);
+    }
+    expect(args).toContain('mcp_servers={\"ambient-host-server\"={enabled=false}}');
     expect(args.some((arg) => arg.includes(permissionProfileId(pty)))).toBe(true);
     expect(JSON.stringify(args)).not.toMatch(/danger-full-access|dangerFullAccess|sandbox_mode/);
+  });
+
+  it('cleans private temp and socket state on an unexpected app-server exit', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const publishedExit = vi.fn();
+    pty.onExit(publishedExit);
+    let exitHandler: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+    const spawn = vi.fn().mockReturnValue({
+      pid: 88,
+      write: vi.fn(),
+      onData: vi.fn(),
+      onExit: vi.fn((handler) => { exitHandler = handler; }),
+      kill: vi.fn(),
+    });
+    (pty as unknown as { _spawnFn: typeof spawn; _alive: boolean })._spawnFn = spawn;
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _startupComplete: boolean })._startupComplete = true;
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await (pty as unknown as { startAppServer(): Promise<void> }).startAppServer();
+    expect(exitHandler).not.toBeNull();
+    (exitHandler as unknown as (event: { exitCode: number }) => void)({ exitCode: 1 });
+
+    expect(fsMocks.rmSync).toHaveBeenCalledWith(
+      '/tmp/ctx/state/codex-app-agent/model-tmp',
+      { recursive: true, force: true },
+    );
+    expect(fsMocks.unlinkSync).toHaveBeenCalledWith(
+      '/tmp/ctx/state/codex-app-agent/codex.sock',
+    );
+    expect(publishedExit).toHaveBeenCalledWith(1, undefined);
+  });
+
+  it('keeps a failed internal app-server attempt inside the adapter retry boundary', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const publishedExit = vi.fn();
+    pty.onExit(publishedExit);
+    let exitHandler: ((event: { exitCode: number; signal?: number }) => void) | null = null;
+    const spawn = vi.fn().mockReturnValue({
+      pid: 88,
+      write: vi.fn(),
+      onData: vi.fn(),
+      onExit: vi.fn((handler) => { exitHandler = handler; }),
+      kill: vi.fn(),
+    });
+    (pty as unknown as { _spawnFn: typeof spawn; _alive: boolean })._spawnFn = spawn;
+    (pty as unknown as { _alive: boolean })._alive = true;
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await (pty as unknown as { startAppServer(): Promise<void> }).startAppServer();
+    (exitHandler as unknown as (event: { exitCode: number }) => void)({ exitCode: 1 });
+
+    expect(publishedExit).not.toHaveBeenCalled();
+  });
+
+  it('discovers host MCP configuration privately and disables every server outside the role allowlist', () => {
+    spawnSyncMock.mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify([
+        { name: 'approved-role-server', enabled: true, transport: { authorization: 'must-not-log' } },
+        { name: 'ambient-host-server', enabled: true, transport: { authorization: 'must-not-log' } },
+      ]),
+      stderr: '',
+      error: undefined,
+    });
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+
+    const args = (pty as unknown as { buildMcpConfigArgs(): string[] }).buildMcpConfigArgs();
+
+    expect(args).toEqual(['-c', 'mcp_servers={"ambient-host-server"={enabled=false}}']);
+    expect(JSON.stringify(args)).not.toContain('must-not-log');
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      'codex',
+      expect.arrayContaining(['--disable', 'apps', '--disable', 'plugins', 'mcp', 'list', '--json']),
+      expect.objectContaining({
+        cwd: mockEnv.agentDir,
+        encoding: 'utf-8',
+        maxBuffer: 1024 * 1024,
+      }),
+    );
+  });
+
+  it('fails closed when an allowlisted MCP server is absent or disabled', () => {
+    spawnSyncMock.mockReturnValue({
+      status: 0,
+      stdout: JSON.stringify([{ name: 'approved-role-server', enabled: false }]),
+      stderr: '',
+      error: undefined,
+    });
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+
+    expect(() => (pty as unknown as { buildMcpConfigArgs(): string[] }).buildMcpConfigArgs())
+      .toThrow(/not configured and enabled/);
+  });
+
+  it('loads only explicitly allowlisted role secrets from inherited env files', () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue([
+      'CC_AGENT_ACTION_TOKEN=scoped-test-token',
+      'ANTHROPIC_API_KEY=must-not-inherit',
+      'PATH=/hostile/path',
+      '',
+    ].join('\n'));
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+
+    const env = (pty as unknown as { buildEnv(): Record<string, string> }).buildEnv();
+
+    expect(env.CC_AGENT_ACTION_TOKEN).toBe('scoped-test-token');
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.PATH).not.toBe('/hostile/path');
+    expect(env.CTX_AGENT_NAME).toBe('codex-app-agent');
+    expect(env.TMPDIR).toBe('/tmp/ctx/state/codex-app-agent/model-tmp');
+    expect(env.TMP).toBe(env.TMPDIR);
+    expect(env.TEMP).toBe(env.TMPDIR);
+  });
+
+  it('prepares only a private model temp child and rejects a symlinked state directory', () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { preparePrivateModelTempDir(): void }).preparePrivateModelTempDir();
+
+    expect(fsMocks.chmodSync).toHaveBeenCalledWith('/tmp/ctx/state/codex-app-agent', 0o700);
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith(
+      '/tmp/ctx/state/codex-app-agent/model-tmp',
+      { recursive: false, mode: 0o700 },
+    );
+    expect(fsMocks.chmodSync).toHaveBeenCalledWith(
+      '/tmp/ctx/state/codex-app-agent/model-tmp',
+      0o700,
+    );
+
+    fsMocks.lstatSync.mockReturnValueOnce({
+      isSymbolicLink: () => true,
+      isDirectory: () => false,
+    });
+    expect(() => (pty as unknown as { preparePrivateModelTempDir(): void })
+      .preparePrivateModelTempDir()).toThrow(/state directory must be a real directory/);
   });
 });
 
@@ -1072,9 +1564,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
   it('starts a new thread in fresh mode', async () => {
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const profileId = permissionProfileId(pty);
-    requestMock.mockResolvedValue({
-      result: { thread: { id: 'fresh-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
-    });
+    requestMock.mockResolvedValue({ result: safeThreadResult(pty, 'fresh-thread') });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
@@ -1083,7 +1573,6 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
       permissions: profileId,
-      config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
       persistExtendedHistory: true,
@@ -1104,9 +1593,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     }));
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const profileId = permissionProfileId(pty);
-    requestMock.mockResolvedValue({
-      result: { thread: { id: 'persisted-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
-    });
+    requestMock.mockResolvedValue({ result: safeThreadResult(pty, 'persisted-thread') });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
@@ -1116,7 +1603,6 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
       permissions: profileId,
-      config: { features: { goals: true } },
       excludeTurns: true,
       persistExtendedHistory: true,
     });
@@ -1131,9 +1617,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     }));
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const profileId = permissionProfileId(pty);
-    requestMock.mockResolvedValue({
-      result: { thread: { id: 'new-fresh-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
-    });
+    requestMock.mockResolvedValue({ result: safeThreadResult(pty, 'new-fresh-thread') });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
@@ -1143,7 +1627,6 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
       permissions: profileId,
-      config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
       persistExtendedHistory: true,
@@ -1228,12 +1711,131 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     expect(requestMock.mock.calls.map(([method]) => method)).toEqual(['thread/resume']);
   });
 
+  it('rejects a matching profile id whose parent is not the read-only base', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const result = safeThreadResult(pty, 'unsafe-parent');
+    result.activePermissionProfile.extends = ':workspace';
+    requestMock.mockResolvedValue({ result });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/profile parent mismatch/);
+  });
+
+  it('rejects extra writable roots not declared by the role policy', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const result = safeThreadResult(pty, 'extra-root');
+    result.sandbox.writableRoots = [...result.sandbox.writableRoots, '/tmp/unapproved'];
+    requestMock.mockResolvedValue({ result });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/writable roots mismatch/);
+  });
+
+  it('does not hide an unexpected writable cwd when the role declared other roots', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const result = safeThreadResult(pty, 'cwd-leak');
+    result.sandbox.writableRoots = [
+      ...result.sandbox.writableRoots,
+      mockEnv.agentDir,
+    ];
+    requestMock.mockResolvedValue({ result });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/writable roots mismatch/);
+  });
+
+  it('rejects malformed writable-root entries instead of filtering them out', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const result = safeThreadResult(pty, 'malformed-roots');
+    (result.sandbox as { writableRoots: unknown[] }).writableRoots = [
+      ...result.sandbox.writableRoots,
+      42,
+    ];
+    requestMock.mockResolvedValue({ result });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/malformed writable roots/);
+  });
+
+  it('accepts a declared writable cwd as the implicit workspace root while retaining private temp', async () => {
+    const config = {
+      ...secureConfig,
+      working_directory: mockEnv.agentDir,
+      codex_writable_paths: [mockEnv.agentDir],
+      codex_readonly_paths: [],
+    };
+    const pty = new CodexAppServerPTY(mockEnv, config);
+    const result = {
+      thread: { id: 'implicit-cwd' },
+      activePermissionProfile: { id: permissionProfileId(pty), extends: ':read-only' },
+      sandbox: {
+        type: 'workspaceWrite',
+        writableRoots: ['/tmp/ctx/state/codex-app-agent/model-tmp'],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true, excludeSlashTmp: true,
+      },
+    };
+    requestMock.mockResolvedValue({ result });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).resolves.toBeUndefined();
+  });
+
+  it('keeps a no-role-write profile limited to the adapter-owned private temp root', async () => {
+    const config = {
+      ...secureConfig,
+      codex_writable_paths: [],
+      codex_readonly_paths: [],
+    };
+    const pty = new CodexAppServerPTY(mockEnv, config);
+    const base = {
+      thread: { id: 'read-only' },
+      activePermissionProfile: { id: permissionProfileId(pty), extends: ':read-only' },
+      sandbox: {
+        type: 'workspaceWrite',
+        writableRoots: ['/tmp/ctx/state/codex-app-agent/model-tmp'],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: true,
+      } as {
+        type: string; networkAccess: boolean; writableRoots?: string[];
+        excludeTmpdirEnvVar?: boolean; excludeSlashTmp?: boolean;
+      },
+    };
+    requestMock.mockResolvedValue({ result: base });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).resolves.toBeUndefined();
+
+    base.sandbox.writableRoots = [
+      '/tmp/ctx/state/codex-app-agent/model-tmp',
+      '/tmp/leaked',
+    ];
+    requestMock.mockResolvedValue({ result: base });
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/writable roots mismatch/);
+  });
+
+  it('rejects effective network access for an offline model process', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const result = safeThreadResult(pty, 'network-drift');
+    result.sandbox.networkAccess = true;
+    requestMock.mockResolvedValue({ result });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/network access mismatch/);
+  });
+
   it('never emits legacy sandbox payloads on thread or turn RPCs', async () => {
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const profileId = permissionProfileId(pty);
-    requestMock.mockResolvedValue({
-      result: { thread: { id: 'safe-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
-    });
+    requestMock.mockResolvedValue({ result: safeThreadResult(pty, 'safe-thread') });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> }).startOrResumeThread('fresh');
@@ -1308,6 +1910,52 @@ describe('CodexAppServerPTY event handling', () => {
     expect(messageHandler).not.toBeNull();
   });
 
+  it('keeps an explicitly allowlisted role MCP available', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+    (pty as unknown as { _alive: boolean })._alive = true;
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'mcpServer/startupStatus/updated',
+      params: { name: 'approved-role-server', status: 'ready' },
+    });
+
+    expect(pty.isAlive()).toBe(true);
+    expect(pty.getOutputBuffer().getRecent()).toContain('approved-role-server ready');
+  });
+
+  it('fails closed if any ambient host MCP server attempts startup', () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { _alive: boolean })._alive = true;
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'mcpServer/startupStatus/updated',
+      params: { name: 'ambient-host-server', status: 'starting' },
+    });
+
+    expect(pty.isAlive()).toBe(false);
+    expect(pty.getOutputBuffer().getRecent()).toContain('Unapproved MCP server ambient-host-server reported starting');
+  });
+
+  it('fails closed when an allowlisted role MCP cannot start', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {
+      ...secureConfig,
+      codex_mcp_allowlist: ['approved-role-server'],
+    });
+    (pty as unknown as { _alive: boolean })._alive = true;
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'mcpServer/startupStatus/updated',
+      params: { name: 'approved-role-server', status: 'failed', error: 'sensitive detail' },
+    });
+
+    expect(pty.isAlive()).toBe(false);
+    expect(pty.getOutputBuffer().getRecent()).toContain('did not become available');
+    expect(pty.getOutputBuffer().getRecent()).not.toContain('sensitive detail');
+  });
+
   it('fails closed if a settings update reports a different active profile', () => {
     const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _alive: boolean; _threadId: string })._alive = true;
@@ -1323,6 +1971,71 @@ describe('CodexAppServerPTY event handling', () => {
 
     expect(pty.isAlive()).toBe(false);
     expect(pty.getOutputBuffer().getRecent()).toContain('active permission profile mismatch');
+  });
+
+  it('keeps a matching full settings update alive', () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { _alive: boolean; _threadId: string })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    const safe = safeThreadResult(pty, 'thread-1');
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {
+          activePermissionProfile: safe.activePermissionProfile,
+          sandboxPolicy: safe.sandbox,
+        },
+      },
+    });
+
+    expect(pty.isAlive()).toBe(true);
+  });
+
+  it.each([
+    {
+      label: 'same id with wrong parent',
+      mutate: (settings: { activePermissionProfile: { extends: string | null } }) => {
+        settings.activePermissionProfile.extends = ':workspace';
+      },
+      expected: /profile parent mismatch/,
+    },
+    {
+      label: 'same id with network expansion',
+      mutate: (settings: { sandboxPolicy: { networkAccess: boolean } }) => {
+        settings.sandboxPolicy.networkAccess = true;
+      },
+      expected: /network access mismatch/,
+    },
+    {
+      label: 'same id with writable-root expansion',
+      mutate: (settings: { sandboxPolicy: { writableRoots: string[] } }) => {
+        settings.sandboxPolicy.writableRoots.push('/tmp/unapproved');
+      },
+      expected: /writable roots mismatch/,
+    },
+  ])('fails closed on $label in a settings update', ({ mutate, expected }) => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { _alive: boolean; _threadId: string })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    const safe = safeThreadResult(pty, 'thread-1');
+    const settings = {
+      activePermissionProfile: { ...safe.activePermissionProfile },
+      sandboxPolicy: {
+        ...safe.sandbox,
+        writableRoots: [...safe.sandbox.writableRoots],
+      },
+    };
+    mutate(settings as never);
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'thread/settings/updated',
+      params: { threadId: 'thread-1', threadSettings: settings },
+    });
+
+    expect(pty.isAlive()).toBe(false);
+    expect(pty.getOutputBuffer().getRecent()).toMatch(expected);
   });
 
   it('fails closed with no fallback if a settings update omits the active profile', () => {

@@ -122,12 +122,12 @@ export function withFileLockSync<T>(
   // Use process.hrtime.bigint() instead of Date.now() so the timeout works
   // under vi.useFakeTimers() (which freezes Date.now).  hrtime reads the
   // monotonic clock via syscall and is not stubbed by fake-timer libraries.
-  const start = process.hrtime.bigint();
-  const timeoutNs = BigInt(timeoutMs) * 1_000_000n;
+  const start = process.hrtime();
   let backoff = initBackoff;
 
   while (!acquireLock(dir)) {
-    if (process.hrtime.bigint() - start > timeoutNs) {
+    const [elapsedSeconds, elapsedNanos] = process.hrtime(start);
+    if ((elapsedSeconds * 1000) + (elapsedNanos / 1_000_000) > timeoutMs) {
       throw new Error(
         `withFileLockSync: failed to acquire lock on "${dir}" within ${timeoutMs}ms`,
       );
