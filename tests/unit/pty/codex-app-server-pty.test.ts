@@ -76,6 +76,15 @@ const mockEnv = {
   projectRoot: '/tmp/fw',
 };
 
+const credentialSecretPath = '/tmp/command-center/brain/.env';
+const secureConfig = {
+  codex_credential_deny_paths: [credentialSecretPath],
+};
+
+function permissionProfileId(pty: InstanceType<typeof CodexAppServerPTY>): string {
+  return (pty as unknown as { _permissionProfileId: string })._permissionProfileId;
+}
+
 beforeEach(() => {
   fsMocks.existsSync.mockReset().mockReturnValue(false);
   fsMocks.readFileSync.mockReset();
@@ -93,7 +102,7 @@ beforeEach(() => {
 
 describe('CodexAppServerPTY socket path policy', () => {
   it('uses codex.sock in the agent state dir by default', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     expect((pty as unknown as { _socketPath: string })._socketPath).toBe('/tmp/ctx/state/codex-app-agent/codex.sock');
     expect((pty as unknown as { _socketListenArg: string })._socketListenArg).toBe('unix://./codex.sock');
   });
@@ -103,8 +112,11 @@ describe('CodexAppServerPTY socket path policy', () => {
       ...mockEnv,
       ctxRoot: `/tmp/${'x'.repeat(120)}`,
     };
-    const pty = new CodexAppServerPTY(longEnv, {});
+    const pty = new CodexAppServerPTY(longEnv, secureConfig);
     const socketPath = (pty as unknown as { _socketPath: string })._socketPath;
+    const profileId = permissionProfileId(pty);
+    const args = (pty as unknown as { _permissionProfileConfigArgs: string[] })._permissionProfileConfigArgs;
+    const overrides = args.filter((_, index) => index % 2 === 1);
     expect(socketPath).toMatch(/\/cas-[a-f0-9]{8}\.sock$/);
     expect((pty as unknown as { _socketListenArg: string })._socketListenArg).toMatch(/^unix:\/\/\.\/cas-[a-f0-9]{8}\.sock$/);
     expect((pty as unknown as { _socketCwd: string })._socketCwd).toBe('/tmp');
@@ -113,12 +125,99 @@ describe('CodexAppServerPTY socket path policy', () => {
       expect.stringContaining('"fallback": true'),
       'utf-8',
     );
+    expect(overrides).toContain(
+      `permissions.${profileId}.filesystem.${JSON.stringify(socketPath)}=\"deny\"`,
+    );
+    expect(overrides).toContain(
+      `permissions.${profileId}.network.unix_sockets.${JSON.stringify(socketPath)}=\"deny\"`,
+    );
+  });
+});
+
+describe('CodexAppServerPTY permission profile policy', () => {
+  it.each([
+    undefined,
+    [],
+    ['relative/brain/.env'],
+    ['/tmp/../brain/.env'],
+    [''],
+    [' /tmp/brain/.env'],
+    ['/tmp/brain/.env\0suffix'],
+    [42],
+  ])('rejects a missing or malformed absolute credential deny list before RPC setup: %j', (paths) => {
+    expect(() => new CodexAppServerPTY(mockEnv, {
+      codex_credential_deny_paths: paths,
+    })).toThrow(/codex_credential_deny_paths/);
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
+  it('compiles a unique named workspace profile with exact secret and control-socket denies', () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const secondPty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const profileId = permissionProfileId(pty);
+    const socketPath = '/tmp/ctx/state/codex-app-agent/codex.sock';
+    const args = (pty as unknown as { _permissionProfileConfigArgs: string[] })._permissionProfileConfigArgs;
+    const overrides = args.filter((_, index) => index % 2 === 1);
+
+    expect(profileId).toMatch(/^cortextos-fleet-[a-f0-9]{16}$/);
+    expect(permissionProfileId(secondPty)).not.toBe(profileId);
+    expect(overrides).toContain(`permissions.${profileId}.extends=\":workspace\"`);
+    expect(overrides).toContain(`permissions.${profileId}.filesystem.${JSON.stringify(credentialSecretPath)}=\"deny\"`);
+    expect(overrides).toContain(`permissions.${profileId}.filesystem.${JSON.stringify(socketPath)}=\"deny\"`);
+    expect(overrides).toContain(`permissions.${profileId}.network.unix_sockets.${JSON.stringify(socketPath)}=\"deny\"`);
+    expect(overrides).toContain(`permissions.${profileId}.network.enabled=true`);
+    expect(overrides).toContain(`permissions.${profileId}.network.domains.\"*\"=\"allow\"`);
+    expect(JSON.stringify(args)).not.toMatch(/danger-full-access|dangerFullAccess|sandbox_mode/);
+  });
+
+  it.each([
+    { entries: [], expected: /not available/ },
+    { entries: [{ id: 'PROFILE_ID', allowed: false }], expected: /not allowed/ },
+  ])('fails closed when the provisioned named profile is missing or disallowed', async ({ entries, expected }) => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const profileId = permissionProfileId(pty);
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+    requestMock.mockResolvedValue({
+      result: {
+        data: entries.map((entry) => ({
+          ...entry,
+          id: entry.id === 'PROFILE_ID' ? profileId : entry.id,
+        })),
+        nextCursor: null,
+      },
+    });
+
+    await expect((pty as unknown as { verifyPermissionProfileAvailable(): Promise<void> })
+      .verifyPermissionProfileAvailable()).rejects.toThrow(expected);
+    expect(requestMock).toHaveBeenCalledWith('permissionProfile/list', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+    });
+  });
+
+  it('spawns app-server with strict generated config and no danger override', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const spawn = vi.fn().mockReturnValue({
+      pid: 88,
+      write: vi.fn(),
+      onData: vi.fn(),
+      onExit: vi.fn(),
+      kill: vi.fn(),
+    });
+    (pty as unknown as { _spawnFn: typeof spawn })._spawnFn = spawn;
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await (pty as unknown as { startAppServer(): Promise<void> }).startAppServer();
+
+    const args = spawn.mock.calls[0][1] as string[];
+    expect(args).toContain('--strict-config');
+    expect(args.some((arg) => arg.includes(permissionProfileId(pty)))).toBe(true);
+    expect(JSON.stringify(args)).not.toMatch(/danger-full-access|dangerFullAccess|sandbox_mode/);
   });
 });
 
 describe('CodexAppServerPTY command mapping', () => {
   function makeReadyPty() {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _alive: boolean })._alive = true;
     (pty as unknown as { _threadId: string })._threadId = 'thread-1';
     (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
@@ -286,7 +385,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
         { type: 'text', text: 'make a logo', text_elements: [] },
       ],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
   });
 
@@ -316,7 +415,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
         { type: 'text', text: 'make a logo', text_elements: [] },
       ],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
 
     (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
@@ -348,7 +447,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
       threadId: 'thread-1',
       input: [{ type: 'skill', name: 'heartbeat', path: '/h.md' }],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
   });
 
@@ -404,7 +503,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
         { type: 'text', text: 'extra context here', text_elements: [] },
       ],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
   });
 
@@ -453,7 +552,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
       threadId: 'thread-1',
       input: [{ type: 'skill', name: 'heartbeat', path: '/h.md' }],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
   });
 
@@ -471,7 +570,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'first', text_elements: [] }],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
 
     pty.write('second');
@@ -488,7 +587,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'second', text_elements: [] }],
       approvalPolicy: 'never',
-      sandboxPolicy: { type: 'dangerFullAccess' },
+      permissions: permissionProfileId(pty),
     });
 
     internals.handleRpcMessage({ method: 'turn/completed', params: {} });
@@ -497,7 +596,7 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
 
 describe('CodexAppServerPTY mid-turn steer', () => {
   function makeReadyPty() {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _alive: boolean })._alive = true;
     (pty as unknown as { _threadId: string })._threadId = 'thread-1';
     (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
@@ -684,14 +783,14 @@ describe('CodexAppServerPTY extractTelegramPayload media types', () => {
   function extract(content: string, options?: { existsSync?: boolean; readFileSync?: string }): string | null {
     if (options?.existsSync !== undefined) fsMocks.existsSync.mockReturnValue(options.existsSync);
     if (options?.readFileSync !== undefined) fsMocks.readFileSync.mockReturnValue(options.readFileSync);
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const result = (pty as unknown as {
       extractTelegramPayload(c: string): { payload: string; replyDirective: string | null } | null;
     }).extractTelegramPayload(content);
     return result?.payload ?? null;
   }
   function extractWithDirective(content: string): { payload: string; replyDirective: string | null } | null {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     return (pty as unknown as {
       extractTelegramPayload(c: string): { payload: string; replyDirective: string | null } | null;
     }).extractTelegramPayload(content);
@@ -971,8 +1070,11 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
 
 describe('CodexAppServerPTY thread lifecycle', () => {
   it('starts a new thread in fresh mode', async () => {
-    requestMock.mockResolvedValue({ result: { thread: { id: 'fresh-thread' } } });
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const profileId = permissionProfileId(pty);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'fresh-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
+    });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
@@ -980,7 +1082,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     expect(requestMock).toHaveBeenCalledWith('thread/start', {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
+      permissions: profileId,
       config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
@@ -1000,8 +1102,11 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       updatedAt: '2026-05-07T00:00:00Z',
     }));
-    requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-thread' } } });
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const profileId = permissionProfileId(pty);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'persisted-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
+    });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('continue');
@@ -1010,7 +1115,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       threadId: 'persisted-thread',
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
+      permissions: profileId,
       config: { features: { goals: true } },
       excludeTurns: true,
       persistExtendedHistory: true,
@@ -1024,8 +1129,11 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       updatedAt: '2026-05-07T00:00:00Z',
     }));
-    requestMock.mockResolvedValue({ result: { thread: { id: 'new-fresh-thread' } } });
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const profileId = permissionProfileId(pty);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'new-fresh-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
+    });
     (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
 
     await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
@@ -1034,7 +1142,7 @@ describe('CodexAppServerPTY thread lifecycle', () => {
     expect(requestMock).toHaveBeenCalledWith('thread/start', {
       cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
       approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
+      permissions: profileId,
       config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
@@ -1050,17 +1158,115 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       'utf-8',
     );
   });
+
+  it('rejects a start response whose returned active profile does not match', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'unsafe-thread' }, activePermissionProfile: { id: ':danger-full-access', extends: null } },
+    });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/active permission profile mismatch/);
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-thread.json'),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('rejects a start response that omits the returned active profile', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'profileless-thread' } },
+    });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> })
+      .startOrResumeThread('fresh')).rejects.toThrow(/active permission profile mismatch.*none/);
+    expect(requestMock.mock.calls.map(([method]) => method)).toEqual(['thread/start']);
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-thread.json'),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('does not downgrade or fall back when a persisted resume returns the wrong profile', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'persisted-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-05-07T00:00:00Z',
+    }));
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'persisted-thread' }, activePermissionProfile: { id: ':workspace', extends: null } },
+    });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'continue'): Promise<void> })
+      .startOrResumeThread('continue')).rejects.toThrow(/active permission profile mismatch/);
+    expect(requestMock.mock.calls.map(([method]) => method)).toEqual(['thread/resume']);
+  });
+
+  it('does not downgrade or fall back when a persisted resume omits the returned active profile', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'persisted-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-05-07T00:00:00Z',
+    }));
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'persisted-thread' } },
+    });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect((pty as unknown as { startOrResumeThread(mode: 'continue'): Promise<void> })
+      .startOrResumeThread('continue')).rejects.toThrow(/active permission profile mismatch.*none/);
+    expect(requestMock.mock.calls.map(([method]) => method)).toEqual(['thread/resume']);
+  });
+
+  it('never emits legacy sandbox payloads on thread or turn RPCs', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    const profileId = permissionProfileId(pty);
+    requestMock.mockResolvedValue({
+      result: { thread: { id: 'safe-thread' }, activePermissionProfile: { id: profileId, extends: ':workspace' } },
+    });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh'): Promise<void> }).startOrResumeThread('fresh');
+    const turn = (pty as unknown as { startTurn(input: unknown[]): Promise<void> })
+      .startTurn([{ type: 'text', text: 'safe', text_elements: [] }]);
+    await Promise.resolve();
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'safe-thread', turn: { id: 'turn-1' } },
+    });
+    await turn;
+
+    expect(requestMock).toHaveBeenCalledWith('turn/start', {
+      threadId: 'safe-thread',
+      input: [{ type: 'text', text: 'safe', text_elements: [] }],
+      approvalPolicy: 'never',
+      permissions: profileId,
+    });
+    expect(JSON.stringify(requestMock.mock.calls)).not.toMatch(
+      /danger-full-access|dangerFullAccess|sandboxPolicy|\"sandbox\"/,
+    );
+  });
 });
 
 describe('CodexAppServerPTY event handling', () => {
   it('bootstraps on the app-server ready marker', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     pty.getOutputBuffer().push('[codex-app-server] ready thread=abc\n');
     expect(pty.getOutputBuffer().isBootstrapped()).toBe(true);
   });
 
   it('responds with an error for unsupported server requests', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _rpc: { respondError: typeof respondErrorMock } })._rpc = { respondError: respondErrorMock };
     (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
       id: 7,
@@ -1085,7 +1291,7 @@ describe('CodexAppServerPTY event handling', () => {
   });
 
   it('fires Telegram typing from streamed assistant deltas', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const api = { sendChatAction: vi.fn().mockResolvedValue(undefined) };
     pty.setTelegramHandle(api as unknown as Parameters<typeof pty.setTelegramHandle>[0], '12345');
     (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
@@ -1097,9 +1303,45 @@ describe('CodexAppServerPTY event handling', () => {
   });
 
   it('registers a message handler when connecting RPC', async () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     await (pty as unknown as { connectRpc(): Promise<void> }).connectRpc();
     expect(messageHandler).not.toBeNull();
+  });
+
+  it('fails closed if a settings update reports a different active profile', () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { _alive: boolean; _threadId: string })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: { activePermissionProfile: { id: ':workspace', extends: null } },
+      },
+    });
+
+    expect(pty.isAlive()).toBe(false);
+    expect(pty.getOutputBuffer().getRecent()).toContain('active permission profile mismatch');
+  });
+
+  it('fails closed with no fallback if a settings update omits the active profile', () => {
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
+    (pty as unknown as { _alive: boolean; _threadId: string })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {},
+      },
+    });
+
+    expect(pty.isAlive()).toBe(false);
+    expect(pty.getOutputBuffer().getRecent()).toContain('active permission profile mismatch');
+    expect(pty.getOutputBuffer().getRecent()).toContain('got none');
+    expect(requestMock).not.toHaveBeenCalled();
   });
 });
 
@@ -1118,7 +1360,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   }
 
   it('writes context_status.json atomically with computed used_percentage', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 5000, inputTokens: 60000, outputTokens: 4000, reasoningOutputTokens: 1000, totalTokens: 70000 },
@@ -1144,7 +1386,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('falls back to default 256000 cap when modelContextWindow is null', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 64000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 64000 },
@@ -1158,7 +1400,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('honours codex_context_cap config override when modelContextWindow is null', () => {
-    const pty = new CodexAppServerPTY(mockEnv, { codex_context_cap: 100000 });
+    const pty = new CodexAppServerPTY(mockEnv, { ...secureConfig, codex_context_cap: 100000 });
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 50000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 50000 },
@@ -1172,7 +1414,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('flags exceeds_200k_tokens once total > 200k', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 210000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 210000 },
@@ -1185,7 +1427,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('clamps used_percentage to 100 when totals exceed cap', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 300000, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 300000 },
@@ -1198,7 +1440,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('uses current-window last tokens instead of lifetime total tokens', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 30000, inputTokens: 80000, outputTokens: 2000, reasoningOutputTokens: 0, totalTokens: 82000 },
@@ -1218,7 +1460,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('writes null used_percentage instead of false-100 when current-window data is missing', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       total: { cachedInputTokens: 312000000, inputTokens: 323000000, outputTokens: 880000, reasoningOutputTokens: 0, totalTokens: 324000000 },
@@ -1237,7 +1479,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('skips the write when params.tokenUsage is missing', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
       method: 'thread/tokenUsage/updated',
@@ -1247,7 +1489,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('writes null used_percentage when total.totalTokens is missing', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1258,7 +1500,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
   });
 
   it('still emits the event log line even on a successful context write', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1270,7 +1512,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → context_status.json', 
 
   it('does not throw when atomicWriteSync rejects (write failure is non-fatal)', () => {
     atomicWriteSyncMock.mockImplementationOnce(() => { throw new Error('disk full'); });
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     expect(() => feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1300,7 +1542,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   }
 
   it('appends a JSONL line to <ctxRoot>/logs/<agent>/codex-tokens.jsonl on tokenUsage', () => {
-    const pty = new CodexAppServerPTY(mockEnv, { model: 'gpt-5-codex' });
+    const pty = new CodexAppServerPTY(mockEnv, { ...secureConfig, model: 'gpt-5-codex' });
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1325,7 +1567,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 
   it('defaults model to gpt-5-codex when config.model is unset', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1338,7 +1580,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 
   it('preserves config.model override when set', () => {
-    const pty = new CodexAppServerPTY(mockEnv, { model: 'gpt-5-codex-preview' });
+    const pty = new CodexAppServerPTY(mockEnv, { ...secureConfig, model: 'gpt-5-codex-preview' });
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1351,7 +1593,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 
   it('skips append when turnId is missing', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1363,7 +1605,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 
   it('skips append when threadId has not been set', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
       total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 50, reasoningOutputTokens: 0, totalTokens: 150 },
@@ -1374,7 +1616,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 
   it('skips append when params.tokenUsage is missing', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
       method: 'thread/tokenUsage/updated',
@@ -1384,7 +1626,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
   });
 
   it('produces a separate JSONL line per turn (no implicit dedup at writer)', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1407,7 +1649,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
 
   it('does not throw when appendFileSync rejects (cost logging is non-fatal)', () => {
     fsMocks.appendFileSync.mockImplementationOnce(() => { throw new Error('disk full'); });
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     (pty as unknown as { _threadId: string })._threadId = 'thread-9';
     expect(() => feedTokenUsage(pty, {
       last: { cachedInputTokens: 0, inputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0 },
@@ -1419,7 +1661,7 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
 
 describe('CodexAppServerPTY buildMediaPayload — dynamic fence parsing', () => {
   it('extracts a caption wrapped in a dynamically-sized (4-backtick) fence', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     // wrapFenceSafe grows the fence to 4 backticks when the caption contains ```;
     // the consumer must match the same fence length, not a hard-coded ```.
     const beforeReply = [
@@ -1436,7 +1678,7 @@ describe('CodexAppServerPTY buildMediaPayload — dynamic fence parsing', () => 
   });
 
   it('still extracts a caption in a plain 3-backtick fence', () => {
-    const pty = new CodexAppServerPTY(mockEnv, {});
+    const pty = new CodexAppServerPTY(mockEnv, secureConfig);
     const beforeReply = '=== TELEGRAM PHOTO from Bob (chat_id:2) ===\ncaption:\n```\nhello\n```\nlocal_file: /tmp/x.jpg';
     const payload = (pty as unknown as { buildMediaPayload(t: string, b: string): string | null })
       .buildMediaPayload('PHOTO', beforeReply);

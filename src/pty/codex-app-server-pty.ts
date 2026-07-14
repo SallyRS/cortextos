@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join, normalize } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
@@ -46,6 +46,18 @@ interface ThreadResponse {
     id: string;
     status?: unknown;
   };
+  activePermissionProfile: {
+    id: string;
+    extends?: string | null;
+  } | null;
+}
+
+interface PermissionProfileListResponse {
+  data: Array<{
+    id: string;
+    allowed: boolean;
+  }>;
+  nextCursor?: string | null;
 }
 
 interface SkillsListResponse {
@@ -67,19 +79,17 @@ interface GoalResponse {
   } | null;
 }
 
-const THREAD_PERMISSION_OVERRIDES = {
-  approvalPolicy: 'never',
-  sandbox: 'danger-full-access',
-} as const;
-
-const TURN_PERMISSION_OVERRIDES = {
-  approvalPolicy: 'never',
-  sandboxPolicy: { type: 'dangerFullAccess' },
-} as const;
+class PermissionProfileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PermissionProfileError';
+  }
+}
 
 const SOCKET_BASENAME = 'codex.sock';
 const SOCKET_PATH_WARN_BYTES = 100;
 const BOOTSTRAP_PATTERN = '[codex-app-server] ready';
+const PERMISSION_PROFILE_PREFIX = 'cortextos-fleet';
 
 const SLASH_REWRITE_RE = /^\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i;
 const LOCAL_SLASH_COMMANDS = new Set(['goal']);
@@ -118,6 +128,8 @@ export class CodexAppServerPTY {
   private _socketCwd: string;
   private _threadStatePath: string;
   private _socketPointerPath: string;
+  private readonly _permissionProfileId: string;
+  private readonly _permissionProfileConfigArgs: string[];
   private _threadId: string | null = null;
   private _telegramApi: TelegramAPI | null = null;
   private _chatId: string | null = null;
@@ -130,10 +142,14 @@ export class CodexAppServerPTY {
     this._stateDir = join(env.ctxRoot, 'state', env.agentName);
     this._threadStatePath = join(this._stateDir, 'codex-app-server-thread.json');
     this._socketPointerPath = join(this._stateDir, 'codex-app-server-socket.json');
+    const credentialDenyPaths = validateCredentialDenyPaths(config.codex_credential_deny_paths);
     const socket = this.resolveSocketPath();
     this._socketPath = socket.path;
     this._socketListenArg = socket.listenArg;
     this._socketCwd = socket.cwd;
+    const profile = buildPermissionProfile(credentialDenyPaths, this._socketPath);
+    this._permissionProfileId = profile.id;
+    this._permissionProfileConfigArgs = profile.configArgs;
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
   }
 
@@ -423,7 +439,9 @@ export class CodexAppServerPTY {
       const spawnFn = this._spawnFn!;
       const pty = spawnFn('codex', [
         'app-server',
+        '--strict-config',
         '--enable', 'goals',
+        ...this._permissionProfileConfigArgs,
         '--listen', this._socketListenArg,
       ], {
         name: 'xterm-256color',
@@ -477,6 +495,24 @@ export class CodexAppServerPTY {
       capabilities: { experimentalApi: true },
     });
     this._rpc?.notify('initialized');
+    await this.verifyPermissionProfileAvailable();
+  }
+
+  private async verifyPermissionProfileAvailable(): Promise<void> {
+    const response = await this.request<PermissionProfileListResponse>('permissionProfile/list', {
+      cwd: this._cwd,
+    });
+    const profile = response.result?.data?.find((entry) => entry.id === this._permissionProfileId);
+    if (!profile) {
+      throw new PermissionProfileError(
+        `Required Codex permission profile ${this._permissionProfileId} is not available`,
+      );
+    }
+    if (profile.allowed !== true) {
+      throw new PermissionProfileError(
+        `Required Codex permission profile ${this._permissionProfileId} is not allowed`,
+      );
+    }
   }
 
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
@@ -487,14 +523,17 @@ export class CodexAppServerPTY {
           const resumed = await this.request<ThreadResponse>('thread/resume', {
             threadId: persisted.threadId,
             cwd: this._cwd,
-            ...THREAD_PERMISSION_OVERRIDES,
+            approvalPolicy: 'never',
+            permissions: this._permissionProfileId,
             config: { features: { goals: true } },
             excludeTurns: true,
             persistExtendedHistory: true,
           });
+          this.verifyActivePermissionProfile(resumed, 'thread/resume');
           this.setThreadId(resumed.result?.thread.id || persisted.threadId);
           return;
         } catch (err) {
+          if (err instanceof PermissionProfileError) throw err;
           this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
         }
       }
@@ -504,11 +543,13 @@ export class CodexAppServerPTY {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: latest,
           cwd: this._cwd,
-          ...THREAD_PERMISSION_OVERRIDES,
+          approvalPolicy: 'never',
+          permissions: this._permissionProfileId,
           config: { features: { goals: true } },
           excludeTurns: true,
           persistExtendedHistory: true,
         });
+        this.verifyActivePermissionProfile(resumed, 'thread/resume');
         this.setThreadId(resumed.result?.thread.id || latest);
         return;
       }
@@ -516,13 +557,24 @@ export class CodexAppServerPTY {
 
     const started = await this.request<ThreadResponse>('thread/start', {
       cwd: this._cwd,
-      ...THREAD_PERMISSION_OVERRIDES,
+      approvalPolicy: 'never',
+      permissions: this._permissionProfileId,
       config: { features: { goals: true } },
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
+    this.verifyActivePermissionProfile(started, 'thread/start');
     this.setThreadId(started.result!.thread.id);
+  }
+
+  private verifyActivePermissionProfile(response: JsonRpcResponse<ThreadResponse>, method: string): void {
+    const actual = response.result?.activePermissionProfile?.id ?? null;
+    if (actual !== this._permissionProfileId) {
+      throw new PermissionProfileError(
+        `${method} active permission profile mismatch: expected ${this._permissionProfileId}, got ${actual ?? 'none'}`,
+      );
+    }
   }
 
   private async findLatestThreadForCwd(): Promise<string | null> {
@@ -599,7 +651,12 @@ export class CodexAppServerPTY {
   private async startTurn(input: unknown[]): Promise<void> {
     if (!this._threadId) throw new Error('No Codex app-server thread is active');
     const completion = this.createTurnCompletion();
-    await this.request('turn/start', { threadId: this._threadId, input, ...TURN_PERMISSION_OVERRIDES });
+    await this.request('turn/start', {
+      threadId: this._threadId,
+      input,
+      approvalPolicy: 'never',
+      permissions: this._permissionProfileId,
+    });
     await completion;
   }
 
@@ -736,6 +793,26 @@ export class CodexAppServerPTY {
       case 'thread/goal/cleared':
         this._outputBuffer.push('[goal] cleared\n');
         break;
+      case 'thread/settings/updated': {
+        const threadId = typeof params.threadId === 'string' ? params.threadId : null;
+        if (threadId === this._threadId) {
+          const settings = isRecord(params.threadSettings) ? params.threadSettings : null;
+          const active = settings && isRecord(settings.activePermissionProfile)
+            ? settings.activePermissionProfile.id
+            : null;
+          if (active !== this._permissionProfileId) {
+            const error = new PermissionProfileError(
+              `thread/settings/updated active permission profile mismatch: expected ${this._permissionProfileId}, got ${typeof active === 'string' ? active : 'none'}`,
+            );
+            this._outputBuffer.push(`[codex-app-server] degraded: ${error.message}\n`);
+            this.rejectTurnCompletion(error);
+            this.kill();
+            return;
+          }
+        }
+        this._outputBuffer.push('[codex-app-server:event] thread/settings/updated\n');
+        break;
+      }
       case 'error':
         this._activeTurnId = null;
         this._outputBuffer.push(`[codex-app-server] error: ${JSON.stringify(params)}\n`);
@@ -1037,6 +1114,58 @@ export class CodexAppServerPTY {
       return '0.0.0';
     }
   }
+}
+
+function validateCredentialDenyPaths(paths: string[] | undefined): string[] {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    throw new Error('codex_credential_deny_paths must contain at least one normalized absolute path');
+  }
+
+  const normalized = paths.map((path, index) => validateAbsolutePolicyPath(
+    path,
+    `codex_credential_deny_paths[${index}]`,
+  ));
+  return [...new Set(normalized)];
+}
+
+function validateAbsolutePolicyPath(path: unknown, label: string): string {
+  if (
+    typeof path !== 'string'
+    || path.length === 0
+    || path.trim() !== path
+    || path.includes('\0')
+    || !isAbsolute(path)
+    || normalize(path) !== path
+  ) {
+    throw new Error(`${label} must be a normalized absolute path`);
+  }
+  return path;
+}
+
+function buildPermissionProfile(
+  credentialDenyPaths: string[],
+  socketPath: string,
+): { id: string; configArgs: string[] } {
+  const exactSocketPath = validateAbsolutePolicyPath(socketPath, 'Codex app-server control socket');
+  const denyPaths = [...new Set([...credentialDenyPaths, exactSocketPath])].sort();
+  const id = `${PERMISSION_PROFILE_PREFIX}-${randomBytes(8).toString('hex')}`;
+  const prefix = `permissions.${id}`;
+  const overrides = [
+    `${prefix}.description=${tomlString('cortextOS fleet workspace with credential isolation')}`,
+    `${prefix}.extends=${tomlString(':workspace')}`,
+    `${prefix}.network.enabled=true`,
+    `${prefix}.network.domains.${tomlString('*')}=${tomlString('allow')}`,
+    `${prefix}.network.unix_sockets.${tomlString(exactSocketPath)}=${tomlString('deny')}`,
+    ...denyPaths.map((path) => `${prefix}.filesystem.${tomlString(path)}=${tomlString('deny')}`),
+  ];
+  return {
+    id,
+    configArgs: overrides.flatMap((override) => ['-c', override]),
+  };
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

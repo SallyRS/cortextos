@@ -195,6 +195,14 @@ export interface AgentConfig {
    */
   codex_context_cap?: number;
   /**
+   * Absolute credential-bearing file or directory paths that the
+   * codex-app-server runtime must deny to model-executed commands. At least
+   * one normalized absolute path is required; relative, empty, or ambiguous
+   * paths fail closed before the app-server is started. The adapter also adds
+   * its active app-server control socket to the same deny policy.
+   */
+  codex_credential_deny_paths?: string[];
+  /**
    * Fallback context window cap (tokens) for opencode agents when the OpenCode
    * model cache does not expose a context limit. Only applies to runtime:
    * 'opencode'.
