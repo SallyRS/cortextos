@@ -25,13 +25,15 @@ import { setupCommand } from './setup.js';
 import { spawnWorkerCommand, terminateWorkerCommand, listWorkersCommand, injectWorkerCommand } from './workers.js';
 import { importAgentCommand } from './import-agent.js';
 import { updateCommand } from './update.js';
+import { lifecycleCommand } from './lifecycle.js';
+import { CORTEXTOS_VERSION } from '../version.js';
 
 const program = new Command();
 
 program
   .name('cortextos')
   .description('Persistent 24/7 Claude Code agents with multi-agent orchestration')
-  .version('0.1.1');
+  .version(CORTEXTOS_VERSION);
 
 program.addCommand(initCommand);
 program.addCommand(installCommand);
@@ -60,6 +62,7 @@ program.addCommand(listWorkersCommand);
 program.addCommand(injectWorkerCommand);
 program.addCommand(importAgentCommand);
 program.addCommand(updateCommand);
+program.addCommand(lifecycleCommand);
 
 // crash-alert: SessionEnd hook — cross-platform replacement for crash-alert.sh
 const crashAlertCommand = new Command('crash-alert')

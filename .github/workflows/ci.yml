@@ -31,6 +31,9 @@ jobs:
       - name: Verify CLI binary
         run: node dist/cli.js --help
 
+      - name: Verify lifecycle status CLI contracts and exits
+        run: node scripts/verify-lifecycle-status-cli.mjs
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest

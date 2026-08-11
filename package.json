@@ -39,6 +39,7 @@
   },
   "files": [
     "dist/",
+    "schemas/",
     "templates/"
   ],
   "dependencies": {
@@ -53,6 +54,7 @@
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@types/node": "^25.5.0",
+    "ajv": "^8.20.0",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
