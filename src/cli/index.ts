@@ -26,6 +26,7 @@ import { spawnWorkerCommand, terminateWorkerCommand, listWorkersCommand, injectW
 import { importAgentCommand } from './import-agent.js';
 import { updateCommand } from './update.js';
 import { lifecycleCommand } from './lifecycle.js';
+import { buzzCommand } from './buzz.js';
 import { slackCommand } from './slack.js';
 import { CORTEXTOS_VERSION } from '../version.js';
 
@@ -51,6 +52,7 @@ program.addCommand(listSkillsCommand);
 program.addCommand(enableAgentCommand);
 program.addCommand(disableAgentCommand);
 program.addCommand(ecosystemCommand);
+program.addCommand(buzzCommand);
 program.addCommand(uninstallCommand);
 program.addCommand(dashboardCommand);
 program.addCommand(tunnelCommand);

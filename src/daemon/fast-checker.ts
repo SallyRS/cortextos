@@ -52,6 +52,10 @@ export class FastChecker {
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
 
+  // External Buzz (Nostr/NIP-29) handler (set by daemon) — SP3b-style parallel
+  // queue alongside telegramMessages, reusing the same isDuplicate dedup.
+  private buzzMessages: Array<{ formatted: string }> = [];
+
   // External Slack handler (set by daemon's Slack dispatcher). Deliberately
   // a separate queue from telegramMessages, not a shared one: draining it
   // must NOT touch lastMessageInjectedAt, which drives the Telegram typing
@@ -189,6 +193,14 @@ export class FastChecker {
   }
 
   /**
+   * Queue a formatted Buzz message for injection.
+   * Called by the daemon's BuzzRelayClient message handler.
+   */
+  queueBuzzMessage(formatted: string): void {
+    this.buzzMessages.push({ formatted });
+  }
+
+  /**
    * Queue a formatted Slack message for injection.
    * Called by the daemon's Slack Socket Mode dispatcher.
    */
@@ -211,6 +223,12 @@ export class FastChecker {
       hasTelegramMessage = true;
     }
 
+    // Process queued Buzz messages
+    while (this.buzzMessages.length > 0) {
+      const msg = this.buzzMessages.shift()!;
+      messageBlock += msg.formatted;
+    }
+
     // Process queued Slack messages. Deliberately does NOT set
     // hasTelegramMessage / lastMessageInjectedAt — see slackMessages'
     // declaration for why the typing-indicator timer must stay
@@ -218,6 +236,7 @@ export class FastChecker {
     while (this.slackMessages.length > 0) {
       messageBlock += this.slackMessages.shift()!;
     }
+
 
     // Check agent inbox
     const inboxMessages = checkInbox(this.paths);
@@ -318,6 +337,28 @@ Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.
     return `=== TELEGRAM from [USER: ${sanitizeForPtyInjection(from)}] (chat_id:${chatId}) ===
 ${replyCx}${historyCx}${body}
 ${lastSentCtx}Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
+
+`;
+  }
+
+  /**
+   * Format a Buzz (Nostr/NIP-29) channel message for injection.
+   * Mirrors formatTelegramTextMessage's shape: [USER: ...] wrapper against
+   * display-name injection, fence-safe body, slash commands passed through
+   * unfenced so the Skill tool can still invoke them.
+   */
+  static formatBuzzTextMessage(
+    from: string,
+    channelId: string,
+    text: string,
+  ): string {
+    const isSlashCommand = /^\/[a-zA-Z]/.test(stripControlChars(text).trim());
+    const body = isSlashCommand
+      ? sanitizeForPtyInjection(text).trim()
+      : wrapFenceSafe(text);
+    return `=== BUZZ from [USER: ${sanitizeForPtyInjection(from)}] (channel:${channelId}) ===
+${body}
+Reply using: cortextos buzz send --channel ${channelId} --text '<your reply>'
 
 `;
   }
