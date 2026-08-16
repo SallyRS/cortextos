@@ -1944,13 +1944,18 @@ function fmtTs(iso: string | undefined): string {
 
 /**
  * Send a reload-crons IPC signal to the daemon (non-blocking, best-effort).
- * Silently swallows errors — the daemon will pick up changes on its next tick.
+ *
+ * This is a fast-path only: it asks the running scheduler to reload crons.json
+ * immediately.  If the signal cannot be delivered, the edit is NOT lost — the
+ * scheduler's tick loop stats crons.json every 30s and reloads on its own when
+ * the file mtime changes (see CronScheduler.tick mtime guard), so a durable
+ * crons.json edit takes effect within one tick regardless of this signal.
  */
 async function signalCronReload(agentName: string, instanceId: string): Promise<void> {
   try {
     const ipc = new IPCClient(instanceId);
     await ipc.send({ type: 'reload-crons', agent: agentName, source: 'cortextos bus cron-cmd' });
-  } catch { /* non-fatal — scheduler picks up file change on next 30s tick */ }
+  } catch { /* non-fatal — the tick loop detects the crons.json mtime change and reloads within ~30s */ }
 }
 
 busCommand

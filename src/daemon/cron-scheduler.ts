@@ -28,7 +28,7 @@
 import { homedir } from 'os';
 import { join } from 'path';
 import { parseDurationMs, readCronState } from '../bus/cron-state.js';
-import { readCronsWithStatus, updateCron } from '../bus/crons.js';
+import { readCronsWithStatus, updateCron, cronsFileMtimeMs } from '../bus/crons.js';
 import type { CronDefinition } from '../types/index.js';
 import { appendExecutionLog } from './cron-execution-log.js';
 
@@ -261,6 +261,13 @@ export class CronScheduler {
    */
   private lastGoodSchedule: Map<string, ScheduledCron> = new Map();
 
+  /**
+   * mtime (ms) of crons.json at the moment loadCrons() last read it.  The tick
+   * loop compares the live file mtime against this to detect durable edits that
+   * arrived without an explicit IPC reload signal, and reloads within one tick.
+   */
+  private lastLoadedCronsMtimeMs: number | null = null;
+
   /** The master 30-second interval handle. */
   private tickHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -331,6 +338,13 @@ export class CronScheduler {
 
   private loadCrons(isReload: boolean): void {
     const now = Date.now();
+    // Capture the file mtime BEFORE reading its contents.  If a write lands
+    // between this stat and the read below, we store the OLDER mtime and read
+    // the NEWER content, so the next tick harmlessly re-reloads rather than
+    // missing the edit — we deliberately err toward an extra reload, never a
+    // missed edit.  This single assignment keeps the tracked mtime in sync for
+    // every caller: start(), reload() (IPC path), and the tick mtime-guard.
+    this.lastLoadedCronsMtimeMs = cronsFileMtimeMs(this.agentName);
     const { crons: defs, corrupt } = readCronsWithStatus(this.agentName);
     const nextScheduled = new Map<string, ScheduledCron>();
 
@@ -362,24 +376,36 @@ export class CronScheduler {
       const key = changeKeyFor(def);
       const existing = this.scheduled.get(def.name);
 
-      if (isReload && existing !== undefined && existing.changeKey === key) {
-        // Definition unchanged — preserve nextFireAt
-        nextScheduled.set(def.name, { ...existing, definition: def });
-        continue;
-      }
-
       // RELOAD-WHILE-FIRING GUARD: if the cron is mid-fire, preserve the
-      // existing entry as-is until the fire completes.  A fresh ScheduledCron
-      // built from stale crons.json (last_fired_at not yet persisted) would
-      // catch-up-fire on the next tick and double-fire the same logical event.
-      // The next reload (manual or after fire completes) will pick up the
-      // new schedule cleanly.
+      // existing entry AS-IS (same object reference) until the fire completes.
+      // A fresh ScheduledCron built from stale crons.json (last_fired_at not yet
+      // persisted) would catch-up-fire on the next tick and double-fire the same
+      // logical event.  The next reload (manual or after fire completes) will
+      // pick up the new schedule cleanly.
+      //
+      // This MUST be checked BEFORE the changeKey-unchanged branch below.  That
+      // branch stores a SHALLOW COPY (`{ ...existing }`) to swap in the new
+      // definition object; for a firing cron the copy would orphan the object
+      // tick() holds — the copy freezes firing=true and the stale nextFireAt,
+      // while the in-flight fire's post-success advances the now-detached
+      // original.  Result: nextFireAt is never updated in the live map and the
+      // cron is stuck firing=true forever.  Ordering the firing guard first
+      // keeps the SAME reference so the completing fire advances the live entry.
+      // (Only exposed once the tick loop can reload mid-fire on an mtime change;
+      // pre-existing latent hazard on the reload-while-unchanged path.)
       if (isReload && existing !== undefined && existing.firing === true) {
         this.logger(
           `[cron-scheduler] reload deferred for "${def.name}" — fire in progress; ` +
           `new schedule will apply on next reload after fire completes`
         );
         nextScheduled.set(def.name, existing);
+        continue;
+      }
+
+      if (isReload && existing !== undefined && existing.changeKey === key) {
+        // Definition unchanged (and not firing) — preserve nextFireAt while
+        // swapping in the new definition object so prompt-only edits apply.
+        nextScheduled.set(def.name, { ...existing, definition: def });
         continue;
       }
 
@@ -454,6 +480,30 @@ export class CronScheduler {
 
   private async tick(): Promise<void> {
     const now = Date.now();
+
+    // MTIME RELOAD GUARD.
+    // The guard reloads whenever crons.json's mtime differs from the last
+    // LOADED mtime.  This INCLUDES the tick after any fire, because tick's own
+    // updateCron bookkeeping writes (last_fire_attempted_at, last_fired_at)
+    // advance the file mtime.  That post-fire reload is intentional and
+    // load-bearing: it is how an external edit that landed while a fire was
+    // awaiting gets picked up.  We deliberately do NOT refresh the tracked
+    // mtime after our own writes — by mtime alone we cannot distinguish our
+    // bookkeeping write from one that merged a concurrent external edit (we are
+    // the last writer either way), so storing the post-write mtime would
+    // permanently mask such an edit.  The reload is correctness-neutral
+    // (nextFireAt is preserved for unchanged changeKey), and is logged like any
+    // other reload for transparency.
+    //
+    // The `!== null` condition means a transient stat failure or unexpected
+    // deletion (null) is treated as "no change" so we never drop the live
+    // schedule on a transient error.  reload() inherits the reload-while-firing
+    // guard, so a cron mid-fire is preserved and an mtime reload cannot
+    // double-fire.
+    const currentMtime = cronsFileMtimeMs(this.agentName);
+    if (currentMtime !== null && currentMtime !== this.lastLoadedCronsMtimeMs) {
+      this.reload();
+    }
 
     for (const [name, sc] of this.scheduled) {
       if (sc.nextFireAt > now) {
