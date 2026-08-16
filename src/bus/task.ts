@@ -510,7 +510,7 @@ export function completeTask(
       logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', 'info', {
         task_id: taskId,
         ...(result ? { result } : {}),
-      });
+      }, { refreshHeartbeat: true });
     } catch {
       // Never let observability break task completion.
     }

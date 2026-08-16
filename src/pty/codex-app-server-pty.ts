@@ -795,6 +795,8 @@ export class CodexAppServerPTY {
   private emitUnsupportedRequestEvent(method: string): void {
     try {
       const paths = resolvePaths(this._env.agentName, this._env.instanceId, this._env.org);
+      // Error/runtime event: deliberately does not refresh heartbeat —
+      // emitting an error does not prove the reasoning loop is alive.
       logEvent(
         paths,
         this._env.agentName,

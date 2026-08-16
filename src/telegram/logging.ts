@@ -113,6 +113,9 @@ export function recordInboundTelegram(
 
   const hasMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
   try {
+    // Daemon-on-behalf delivery write: deliberately does NOT opt into
+    // heartbeat refresh, so a wedged agent's heartbeat cannot be spoofed
+    // fresh by inbound traffic it never acted on.
     logEvent(paths, agentName, org, 'message', 'telegram_received', 'info', {
       chat_id: String(msg.chat?.id ?? ''),
       message_id: msg.message_id,
