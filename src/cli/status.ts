@@ -95,10 +95,12 @@ export function displayStatuses(statuses: AgentStatus[]): void {
   console.log(separator);
 
   let anyAwaiting = false;
+  let anyDormant = false;
   for (const s of statuses) {
     const name = s.name.padEnd(18);
     let label: string = s.status;
     if (s.awaitingConfirmation) { label = 'unhealthy*'; anyAwaiting = true; }
+    if (s.dormant) { label = 'dormant†'; anyDormant = true; }
     const status = label.padEnd(12);
     const pid = (s.pid?.toString() || '-').padEnd(10);
     const uptime = s.uptime ? formatUptime(s.uptime).padEnd(12) : '-'.padEnd(12);
@@ -107,6 +109,7 @@ export function displayStatuses(statuses: AgentStatus[]): void {
   }
 
   if (anyAwaiting) console.log('  * awaiting interactive confirmation (first-run prompt not accepted)\n');
+  if (anyDormant) console.log('  † enabled but heartbeat stale relative to liveness baseline (possible silent dormancy)\n');
 
   console.log('');
 }

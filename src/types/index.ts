@@ -830,4 +830,7 @@ export interface AgentStatus {
   model?: string;
   awaitingConfirmation?: boolean; // first-run observability fix: PTY parked on an
   // interactive first-run prompt past the auto-accept backstop (wedged, not bootstrapped)
+  dormant?: boolean; // silent-dormancy fix: enabled agent whose heartbeat is stale
+  // relative to its own liveness baseline (uptime, or daemon uptime if absent-from-map)
+  dormancyReason?: string; // human explanation of the dormancy verdict
 }
