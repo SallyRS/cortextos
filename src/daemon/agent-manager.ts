@@ -89,6 +89,23 @@ export class AgentManager {
   // entry returns instead of double-spawning a PTY (same hazard class BUG-011's
   // pendingRestarts guards for alive entries).
   private evictingAgents: Set<string> = new Set();
+  // idempotency fix: names with a stopAgent() teardown currently in flight.
+  // Claimed synchronously on stopAgent() entry (before its first await), so a
+  // concurrent startAgent() hitting the alive-branch can tell a legit in-flight
+  // restart (queue via pendingRestarts) from a pure duplicate start (no-op).
+  //
+  // ORDERING INVARIANT (relied on by the alive-branch no-op path): for any
+  // coordinated stop+start pair on the same name, stopAgent() must claim
+  // `stoppingAgents` synchronously BEFORE the paired startAgent() runs its
+  // synchronous prefix (the alive-branch check). All CURRENT dispatch paths
+  // satisfy this: restartAgent() and stopAll() are sequential-await (stop is
+  // fully entered — marker claimed — before start begins), and IPC stop/start
+  // messages are processed in arrival order (a restart-all sends stop first).
+  // A hypothetical FUTURE caller that dispatched startAgent() BEFORE stopAgent()
+  // for a coordinated restart would find `stoppingAgents` still empty, take the
+  // idempotent no-op path, and have its start SWALLOWED — so callers MUST keep
+  // stop-before-start ordering for coordinated restarts.
+  private stoppingAgents: Set<string> = new Set();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -354,15 +371,14 @@ export class AgentManager {
       // (restart-all could send stop+start simultaneously, and the new
       // start would arrive while the old stop's PTY exit was still in
       // flight). PR #11 closed BUG-011 by making `AgentProcess.stop()`
-      // await the actual PTY exit before resolving — which means this
-      // branch should NEVER fire under normal restart paths.
+      // await the actual PTY exit before resolving.
       //
-      // We log a regression warning here instead of deleting the branch
-      // entirely, so we'll know IMMEDIATELY if BUG-011 ever regresses
-      // (a future change accidentally breaks the exit-await). Phase 4 of
-      // the core stability test plan + cycle 2 of PR #13 both confirmed
-      // this branch is dormant. Once we have weeks of zero-warning
-      // production data, we can delete the queue mechanism entirely.
+      // The idempotency fix then repurposed the queue path: the alive sub-branch
+      // below distinguishes a LEGIT in-flight restart (a stopAgent() teardown is
+      // genuinely in flight — stoppingAgents.has — so we queue via pendingRestarts)
+      // from a pure duplicate start against a healthy agent (idempotent no-op).
+      // The legit-restart case fires on every concurrent restart-all and is logged
+      // at info level, NOT as a regression alarm — see the per-case comments below.
       if (this.isAgentActuallyAlive(name)) {
         // ALIVE entry: preserve the existing BUG-011/031/040 dedup/queue behavior
         // EXACTLY — this is the legitimate in-flight-restart race path.
@@ -375,10 +391,28 @@ export class AgentManager {
           // distinct from the BUG-011 in-flight race PR #11 closed. Log at
           // info level so operators don't think PR #11 has regressed.
           console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
-        } else {
-          console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+          this.pendingRestarts.add(name);
+          return;
         }
-        this.pendingRestarts.add(name);
+        if (this.stoppingAgents.has(name)) {
+          // LEGIT in-flight restart: a concurrent stopAgent() is tearing this
+          // agent down but hasn't reached its final PTY-exit line yet, so the
+          // entry still reads as alive. Queue the restart so stopAgent()'s honor
+          // path brings the agent back — the real BUG-011/BUG-031 race path.
+          //
+          // Info-level, NOT a regression alarm: after the idempotency fix this
+          // is the EXPECTED legit-restart race (stoppingAgents proves a teardown
+          // is genuinely in flight), so it fires on every concurrent restart-all.
+          // A true BUG-011 regression (start racing a stop WITHOUT a marker) does
+          // NOT reach here — it falls through to the no-op path below instead.
+          console.log(`[agent-manager] ${name} start raced an in-flight stop (expected legit in-flight restart) — queueing via pendingRestarts; stopAgent's honor path will bring it back.`);
+          this.pendingRestarts.add(name);
+          return;
+        }
+        // SPURIOUS pure duplicate start against a healthy agent nobody is
+        // stopping. No teardown is in flight, so a queued restart would cause a
+        // later spurious restart. Idempotent no-op instead — no warn, no queue.
+        console.log(`[agent-manager] ${name} already running and healthy — duplicate start ignored (idempotent no-op).`);
         return;
       }
       // liveness fix: entry exists but is NOT actually alive (halted/crashed/
@@ -1329,114 +1363,129 @@ export class AgentManager {
       return;
     }
 
-    // map-entry-race fix: capture every name-keyed resource we own BEFORE the
-    // await below. entry.process.stop() yields for up to ~21s (BUG-032's
-    // graceful /exit dance plus BUG-040's 15s exit wait), and a NEW instance can
-    // be registered under this same name inside that window (startAgent's
-    // eviction path, or a fire-and-forget IPC start — ipc-server.ts never awaits
-    // startAgent/stopAgent/restartAgent). After the await, `name` is no longer a
-    // reliable handle to us.
-    // RULE: act unconditionally on the objects you captured; act by name only
-    // while the name still resolves to you. See stillMapped().
-    const scheduler = this.cronSchedulers.get(name);
+    // idempotency fix (#923): claim the name synchronously BEFORE the first await
+    // (entry.process.stop() below) so a startAgent() racing this teardown sees
+    // the marker and queues via pendingRestarts instead of taking the no-op
+    // path. finally (NOT catch) so a throw from process.stop() still propagates
+    // to callers while the marker is always released.
+    this.stoppingAgents.add(name);
+    try {
+      // map-entry-race fix (#895): capture every name-keyed resource we own
+      // BEFORE the await below. entry.process.stop() yields for up to ~21s
+      // (BUG-032's graceful /exit dance plus BUG-040's 15s exit wait), and a NEW
+      // instance can be registered under this same name inside that window
+      // (startAgent's eviction path, or a fire-and-forget IPC start —
+      // ipc-server.ts never awaits startAgent/stopAgent/restartAgent). After the
+      // await, `name` is no longer a reliable handle to us.
+      // RULE: act unconditionally on the objects you captured; act by name only
+      // while the name still resolves to you. See stillMapped().
+      const scheduler = this.cronSchedulers.get(name);
 
-    // Round 3 (F5/F2): mark the teardown BEFORE it starts, not after it finishes.
-    // A poller's stop() cannot recall a getUpdates batch that is already open, and
-    // process.stop() yields for up to ~21s — so callbacks and a parked startAgent
-    // both land DURING the teardown, which is exactly when they must not act.
-    entry.stopped = true;
+      // Round 3 (F5/F2): mark the teardown BEFORE it starts, not after it
+      // finishes. A poller's stop() cannot recall a getUpdates batch that is
+      // already open, and process.stop() yields for up to ~21s — so callbacks and
+      // a parked startAgent both land DURING the teardown, which is exactly when
+      // they must not act.
+      entry.stopped = true;
 
-    if (entry.poller) entry.poller.stop();
-    if (entry.activityPoller) entry.activityPoller.stop();
-    // Unregister from every org's Buzz dispatcher — harmless no-op for orgs
-    // this agent was never registered in. We don't track which org this
-    // agent belongs to on the entry itself, so this sweeps all of them
-    // rather than requiring an extra lookup.
-    for (const buzzEntry of this.buzzClients.values()) {
-      buzzEntry.dispatcher.unregister(name);
-    }
-    entry.checker.stop();
-    await entry.process.stop();
-
-    // Our scheduler object: stopping it is always correct (the interval is
-    // ours, and skipping it leaks a setInterval forever). Unmapping it is only
-    // correct while the name still points at it.
-    if (!scheduler && this.stillMapped(name, entry)) {
-      // The capture above has a blind spot the post-await read it replaced did
-      // not: a scheduler wired for US during the await (startAgent's post-start
-      // wiring at the `startAgentCronScheduler` call below, or reloadCrons'
-      // lazy-create) did not exist when we captured. Nothing else ever stops it
-      // — it outlives the agent as a live setInterval whose onFire injects into
-      // a name that is gone, AND it makes the next start's scheduler request hit
-      // the "already running — skipped" guard, so the replacement inherits a
-      // dead scheduler. Acting by name is safe here BECAUSE the name still
-      // resolves to us, so whatever is under it is ours.
-      const late = this.cronSchedulers.get(name);
-      if (late) {
-        late.stop();
-        this.cronSchedulers.delete(name);
+      if (entry.poller) entry.poller.stop();
+      if (entry.activityPoller) entry.activityPoller.stop();
+      // Unregister from every org's Buzz dispatcher — harmless no-op for orgs
+      // this agent was never registered in. We don't track which org this
+      // agent belongs to on the entry itself, so this sweeps all of them
+      // rather than requiring an extra lookup.
+      for (const buzzEntry of this.buzzClients.values()) {
+        buzzEntry.dispatcher.unregister(name);
       }
-    }
+      entry.checker.stop();
+      await entry.process.stop();
 
-    if (scheduler) {
-      scheduler.stop();
-      if (this.cronSchedulers.get(name) === scheduler) {
-        this.cronSchedulers.delete(name);
-        // If a new instance took the name while we were stopping, it may have
-        // been refused a scheduler by startAgentCronScheduler's "already
-        // running" guard because OURS was still mapped. Re-wire now the slot is
-        // free — otherwise the new agent runs with no crons at all. Calling a
-        // start-path helper from the stop path is deliberate: the method is
-        // idempotent and map-driven, and this is the only moment at which the
-        // newcomer's missing scheduler is detectable.
-        if (!this.stillMapped(name, entry)) this.startAgentCronScheduler(name);
+      // Our scheduler object: stopping it is always correct (the interval is
+      // ours, and skipping it leaks a setInterval forever). Unmapping it is only
+      // correct while the name still points at it.
+      if (!scheduler && this.stillMapped(name, entry)) {
+        // The capture above has a blind spot the post-await read it replaced did
+        // not: a scheduler wired for US during the await (startAgent's post-start
+        // wiring at the `startAgentCronScheduler` call below, or reloadCrons'
+        // lazy-create) did not exist when we captured. Nothing else ever stops it
+        // — it outlives the agent as a live setInterval whose onFire injects into
+        // a name that is gone, AND it makes the next start's scheduler request hit
+        // the "already running — skipped" guard, so the replacement inherits a
+        // dead scheduler. Acting by name is safe here BECAUSE the name still
+        // resolves to us, so whatever is under it is ours.
+        const late = this.cronSchedulers.get(name);
+        if (late) {
+          late.stop();
+          this.cronSchedulers.delete(name);
+        }
       }
-    }
 
-    // Round 3 (F4): same conflation as the eviction path — see the F3 comment in
-    // startAgent(). Reachable here via two concurrent stops for one name (ipc-server
-    // never awaits stopAgent): the first to finish deletes the name, and the second
-    // then took this branch, warned about a re-registration that never happened, and
-    // returned BEFORE the pendingRestarts handling below — stranding a queued restart
-    // that later fires against an unrelated stop.
-    if (this.agents.has(name) && !this.stillMapped(name, entry)) {
-      // Superseded: our instance is fully torn down, but the name belongs to
-      // someone else now. Deleting it here would empty the map slot while the
-      // new agent keeps running — an untracked orphan. pendingRestarts is
-      // deliberately left alone: the queue refers to whoever is mapped.
-      console.warn(`[agent-manager] ${name} was re-registered while stopping — old instance fully torn down, new instance left mapped.`);
-      return;
-    }
-
-    this.agents.delete(name);
-
-    // disable-resurrection fix: an explicit user stop/disable must win against a
-    // racing queued restart. Drop the pending entry instead of honoring it.
-    // Internal callers (restartAgent, stopAll) pass userInitiated=false, so the
-    // BUG-011/BUG-031 restart-all honor path below is preserved unchanged.
-    if (userInitiated) {
-      if (this.pendingRestarts.delete(name)) {
-        console.log(`[agent-manager] Dropped queued restart for ${name} — explicit user stop/disable wins.`);
+      if (scheduler) {
+        scheduler.stop();
+        if (this.cronSchedulers.get(name) === scheduler) {
+          this.cronSchedulers.delete(name);
+          // If a new instance took the name while we were stopping, it may have
+          // been refused a scheduler by startAgentCronScheduler's "already
+          // running" guard because OURS was still mapped. Re-wire now the slot is
+          // free — otherwise the new agent runs with no crons at all. Calling a
+          // start-path helper from the stop path is deliberate: the method is
+          // idempotent and map-driven, and this is the only moment at which the
+          // newcomer's missing scheduler is detectable.
+          if (!this.stillMapped(name, entry)) this.startAgentCronScheduler(name);
+        }
       }
-      return;
-    }
 
-    // BUG-031: honor any restart that was queued while we were stopping.
-    // After PR #11 (BUG-011 fix) this branch should never fire — see the
-    // matching warning comment in startAgent(). The honor logic is preserved
-    // as a safety net in case BUG-011 regresses; the warn line tells us
-    // immediately if it ever does.
-    if (this.pendingRestarts.has(name)) {
-      if (this.daemonJustCrashed) {
-        console.log(`[agent-manager] pendingRestarts fired for ${name} (post-crash safety net, expected). Honoring queued restart.`);
-      } else {
-        console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: pendingRestarts fired for ${name} — race condition leaked through. Honoring queued restart as safety net.`);
+      // Round 3 (F4): same conflation as the eviction path — see the F3 comment in
+      // startAgent(). Reachable here via two concurrent stops for one name (ipc-server
+      // never awaits stopAgent): the first to finish deletes the name, and the second
+      // then took this branch, warned about a re-registration that never happened, and
+      // returned BEFORE the pendingRestarts handling below — stranding a queued restart
+      // that later fires against an unrelated stop.
+      if (this.agents.has(name) && !this.stillMapped(name, entry)) {
+        // Superseded: our instance is fully torn down, but the name belongs to
+        // someone else now. Deleting it here would empty the map slot while the
+        // new agent keeps running — an untracked orphan. pendingRestarts is
+        // deliberately left alone: the queue refers to whoever is mapped. The
+        // finally below still releases stoppingAgents.
+        console.warn(`[agent-manager] ${name} was re-registered while stopping — old instance fully torn down, new instance left mapped.`);
+        return;
       }
-      this.pendingRestarts.delete(name);
-      console.log(`[agent-manager] Honoring queued restart for ${name}`);
-      this.startAgent(name, '').catch(err =>
-        console.error(`[agent-manager] Queued restart failed for ${name}:`, err),
-      );
+
+      this.agents.delete(name);
+
+      // disable-resurrection fix: an explicit user stop/disable must win against a
+      // racing queued restart. Drop the pending entry instead of honoring it.
+      // Internal callers (restartAgent, stopAll) pass userInitiated=false, so the
+      // BUG-011/BUG-031 restart-all honor path below is preserved unchanged.
+      if (userInitiated) {
+        if (this.pendingRestarts.delete(name)) {
+          console.log(`[agent-manager] Dropped queued restart for ${name} — explicit user stop/disable wins.`);
+        }
+        return;
+      }
+
+      // BUG-031: honor any restart that was queued while we were stopping.
+      // After the idempotency fix `pendingRestarts` is a NORMAL control-flow
+      // signal, not a BUG-011 canary. Writers enumeration (both `pendingRestarts.add`
+      // sites in this file): (1) startAgent's post-crash branch — guarded by
+      // daemonJustCrashed=true; (2) startAgent's stoppingAgents.has branch — the
+      // legit in-flight restart. So reaching this honor branch with
+      // daemonJustCrashed=false means writer (2): the EXPECTED legit-restart race.
+      // Both cases are info-level; neither is a regression, so honoring is normal.
+      if (this.pendingRestarts.has(name)) {
+        if (this.daemonJustCrashed) {
+          console.log(`[agent-manager] pendingRestarts fired for ${name} (post-crash safety net, expected). Honoring queued restart.`);
+        } else {
+          console.log(`[agent-manager] pendingRestarts fired for ${name} (expected legit in-flight-restart race). Honoring queued restart.`);
+        }
+        this.pendingRestarts.delete(name);
+        console.log(`[agent-manager] Honoring queued restart for ${name}`);
+        this.startAgent(name, '').catch(err =>
+          console.error(`[agent-manager] Queued restart failed for ${name}:`, err),
+        );
+      }
+    } finally {
+      this.stoppingAgents.delete(name);
     }
   }
 
