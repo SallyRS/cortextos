@@ -29,6 +29,31 @@ const SHELL_DETECT_TAIL_LINES = 20;
 // markers are ruled out.
 const SHELL_PROMPT_TAIL_PATTERN = /[%$#]$/;
 const TELEGRAM_HEADER_PATTERN = /^=== TELEGRAM(?:\s+\w+)?\s+from[^\n]*\(chat_id:(-?\d+)\)/;
+// Stale-process reap tuning. A fire-and-forget SIGTERM (the previous behavior)
+// unlinked the marker and moved on without confirming the orphan actually died,
+// so a wedged prior session could survive and keep re-holding its --continue
+// state. We now poll for exit, escalate to SIGKILL, and confirm-dead before
+// treating the process as reaped.
+const REAP_POLL_INTERVAL_MS = 200;
+const REAP_SIGTERM_GRACE_MS = 2000;
+const REAP_SIGKILL_GRACE_MS = 2000;
+
+const reapSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// OS-level pid liveness probe using the signal-0 idiom (mirrors the isPidAlive
+// helper in src/daemon/agent-manager.ts): signal 0 sends nothing, it only tests
+// existence + our permission to signal. ESRCH => the process is gone (dead);
+// EPERM => it exists but is owned elsewhere (alive). These are our own child
+// processes, so EPERM is not expected, but we honor the same semantics.
+function isReapTargetAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 /**
  * PTY wrapper for OpenCode agents.
@@ -128,7 +153,7 @@ export class OpencodePTY extends AgentPTY {
     // `opencode run <message>`). Cortext agents must stay alive for future
     // Telegram, inbox, and cron injections, so start the persistent TUI first
     // and inject the startup prompt through the normal PTY input path.
-    this.cleanupStaleProcessMarker();
+    await this.cleanupStaleProcessMarker();
     this.spawnStartedAtMs = Date.now();
     await super.spawn(mode, '');
     this.writeSessionMarker(mode);
@@ -409,23 +434,60 @@ If it instructs you to send Telegram or bus output, run the required terminal co
     }
   }
 
-  private cleanupStaleProcessMarker(): void {
+  private async cleanupStaleProcessMarker(): Promise<void> {
     try {
       const markerPath = this.processMarkerPath();
       if (!existsSync(markerPath)) return;
       const parsed = JSON.parse(readFileSync(markerPath, 'utf-8')) as { pid?: unknown };
       const pid = typeof parsed.pid === 'number' ? parsed.pid : null;
       if (pid && pid > 0 && pid !== process.pid) {
-        try {
-          process.kill(pid, 'SIGTERM');
-        } catch {
-          // Missing process or permission failure; either way do not block boot.
-        }
+        await this.terminateStaleProcess(pid);
       }
       unlinkSync(markerPath);
     } catch {
       // A corrupt marker must not block the agent from starting.
     }
+  }
+
+  /**
+   * Terminate a recorded stale OpenCode process and CONFIRM it is dead before
+   * returning: SIGTERM -> poll for exit -> SIGKILL escalation -> poll again.
+   * A bare fire-and-forget SIGTERM could leave a wedged prior session alive
+   * while its marker was already unlinked, so the next spawn ran alongside an
+   * orphan still holding the agent's session/state root. Bounded and best-effort:
+   * a target that survives even SIGKILL is logged, not allowed to block boot.
+   */
+  private async terminateStaleProcess(pid: number): Promise<void> {
+    if (!isReapTargetAlive(pid)) return;
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // ESRCH (already gone) or EPERM — nothing more we can do; treat as reaped.
+      return;
+    }
+    if (await this.waitForProcessExit(pid, REAP_SIGTERM_GRACE_MS)) return;
+
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      return;
+    }
+    if (await this.waitForProcessExit(pid, REAP_SIGKILL_GRACE_MS)) return;
+
+    // Still alive after SIGKILL — do not block boot, but leave a breadcrumb.
+    this.getOutputBuffer().push(
+      `[opencode-pty] stale process ${pid} survived SIGKILL during reap; continuing boot\n`,
+    );
+  }
+
+  /** Poll until the pid is gone or the grace window elapses. Returns true if dead. */
+  private async waitForProcessExit(pid: number, graceMs: number): Promise<boolean> {
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline) {
+      if (!isReapTargetAlive(pid)) return true;
+      await reapSleep(REAP_POLL_INTERVAL_MS);
+    }
+    return !isReapTargetAlive(pid);
   }
 }
 

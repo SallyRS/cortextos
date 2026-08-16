@@ -15,6 +15,16 @@ import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
 
+// opencode --continue wedge auto-recovery thresholds. A wedged session exits
+// code 0 almost immediately on every `--continue` re-attach, so a "wedge exit"
+// is an exit_code=0 that arrives within FAST_EXIT_MS of the spawn. After
+// WEDGE_THRESHOLD consecutive such exits we stop trusting the session marker and
+// force a fresh boot. 3 mirrors the codex thread-resume crash-loop signature
+// (see shouldContinue()); the fast-exit gate keeps a genuinely long, cleanly
+// exited session from ever counting.
+const OPENCODE_CONTINUE_WEDGE_THRESHOLD = 3;
+const OPENCODE_CONTINUE_WEDGE_FAST_EXIT_MS = 60_000;
+
 /**
  * Manages a single agent's lifecycle.
  * Replaces agent-wrapper.sh for one agent.
@@ -69,6 +79,13 @@ export class AgentProcess {
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
+  // opencode --continue wedge auto-recovery state (see the OPENCODE_CONTINUE_WEDGE_*
+  // constants). lastSpawnMode/lastStartAtMs let handleExit tell an immediate
+  // exit-0-on-continue (wedge) apart from a normal exit; the counter tracks the
+  // consecutive streak and is reset by any non-wedge exit.
+  private lastSpawnMode: 'fresh' | 'continue' | null = null;
+  private lastStartAtMs = 0;
+  private opencodeContinueWedgeCount = 0;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -108,6 +125,10 @@ export class AgentProcess {
 
     // Determine start mode
     const mode = this.shouldContinue() ? 'continue' : 'fresh';
+    // Record the mode/time this lifecycle spawned in so handleExit can detect an
+    // immediate exit-0-on-continue wedge (opencode --continue re-attach loop).
+    this.lastSpawnMode = mode;
+    this.lastStartAtMs = Date.now();
     const prompt = mode === 'fresh'
       ? this.buildStartupPrompt()
       : this.buildContinuePrompt();
@@ -619,6 +640,54 @@ export class AgentProcess {
       return;
     }
 
+    // opencode --continue wedge auto-recovery (companion to the image-poison
+    // block above; same shape, different signature). shouldContinue() passes
+    // `opencode --continue` whenever the session marker is present, with no
+    // wedge-awareness — so a session wedged on the bootstrap splash re-attaches
+    // on every crash-recovery restart and exits code 0 almost immediately,
+    // producing a self-perpetuating exit_code=0 loop that drains max_crashes and
+    // halts the agent (measured live 2026-08-12: opencode crashed 10x with
+    // exit_code=0 across 22min, then HALTED). The marker is trusted as "safe to
+    // continue" without confirming the prior session is not wedged. Detect the
+    // signature — an opencode agent, spawned in continue mode, exiting 0 within
+    // FAST_EXIT_MS — and after THRESHOLD consecutive such exits arm .force-fresh
+    // so the next boot discards the wedged session (shouldContinue() honors
+    // .force-fresh for all runtimes). This automates an operator's manual
+    // stop -> drop-marker -> fresh recovery. Like image-poison, a recovery
+    // restart is not charged against max_crashes_per_day — it is a self-inflicted
+    // continuity artifact, not an agent malfunction.
+    if (
+      exitCode === 0 &&
+      this.config.runtime === 'opencode' &&
+      this.lastSpawnMode === 'continue' &&
+      Date.now() - this.lastStartAtMs < OPENCODE_CONTINUE_WEDGE_FAST_EXIT_MS
+    ) {
+      this.opencodeContinueWedgeCount++;
+      if (this.opencodeContinueWedgeCount >= OPENCODE_CONTINUE_WEDGE_THRESHOLD) {
+        this.log(
+          `opencode --continue wedge: ${this.opencodeContinueWedgeCount} consecutive fast exit_code=0 continues — arming .force-fresh and restarting fresh (not counted toward max_crashes_per_day).`,
+        );
+        this.armForceFresh('opencode --continue wedge auto-recovery');
+        this.appendCrashToRestartsLog(exitCode, 5000, 'OPENCODE_CONTINUE_WEDGE_RECOVERY');
+        this.opencodeContinueWedgeCount = 0;
+        this.status = 'crashed';
+        this.notifyStatusChange();
+        setTimeout(() => {
+          if (this.status === 'crashed') {
+            this.start().catch(err => this.log(`opencode wedge recovery restart failed: ${err}`));
+          }
+        }, 5000);
+        return;
+      }
+      // Below threshold: fall through to normal crash recovery (still counted +
+      // backoff). The next restart re-continues; if it wedges again the streak
+      // grows until the threshold trips the force-fresh above.
+    } else {
+      // Any non-wedge exit — nonzero code, fresh mode, or a session that stayed
+      // up past the fast-exit window — breaks the consecutive streak.
+      this.opencodeContinueWedgeCount = 0;
+    }
+
     // CrashLoopPauser (instar-inspired): if a sliding window is configured,
     // check whether the agent is crash-looping before falling through to
     // the legacy daily counter. The window is a more precise signal than
@@ -1021,7 +1090,7 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP' | 'IMAGE_POISON_RECOVERY' | 'OPENCODE_CONTINUE_WEDGE_RECOVERY',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
@@ -1030,7 +1099,7 @@ export class AgentProcess {
       const details =
         kind === 'HALTED'
           ? `exit_code=${exitCode} crash_count=${this.crashCount} max_crashes=${this.maxCrashesPerDay}`
-          : kind === 'IMAGE_POISON_RECOVERY'
+          : kind === 'IMAGE_POISON_RECOVERY' || kind === 'OPENCODE_CONTINUE_WEDGE_RECOVERY'
             ? `exit_code=${exitCode} backoff_s=${backoffMs / 1000} (not counted toward max_crashes)`
             : `exit_code=${exitCode} crash_count=${this.crashCount} backoff_s=${backoffMs / 1000}`;
       const logLine = `[${timestamp}] ${kind}: ${details}\n`;

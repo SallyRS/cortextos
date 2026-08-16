@@ -538,8 +538,22 @@ describe('OpencodePTY', () => {
     }
   });
 
-  it('cleans up a stale recorded OpenCode process before spawning a replacement', async () => {
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  it('SIGTERMs a stale recorded OpenCode process, confirms dead, and removes the marker', async () => {
+    // Simulate a process that exits on SIGTERM: signal-0 probes report alive
+    // until SIGTERM lands, then ESRCH (gone). No SIGKILL escalation is needed.
+    let terminated = false;
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
+      if (sig === 'SIGTERM') { terminated = true; return true; }
+      if (sig === 0) {
+        if (terminated) {
+          const err = new Error('ESRCH') as NodeJS.ErrnoException;
+          err.code = 'ESRCH';
+          throw err;
+        }
+        return true;
+      }
+      return true;
+    }) as typeof process.kill);
     fsMocks.existsSync.mockImplementation((path: string) =>
       path === '/tmp/ctx/state/opencode-agent/opencode-process.json');
     fsMocks.readFileSync.mockImplementation((path: string) => {
@@ -555,11 +569,50 @@ describe('OpencodePTY', () => {
       await pty.spawn('fresh', '');
 
       expect(killSpy).toHaveBeenCalledWith(24680, 'SIGTERM');
+      expect(killSpy).not.toHaveBeenCalledWith(24680, 'SIGKILL');
       expect(fsMocks.unlinkSync).toHaveBeenCalledWith('/tmp/ctx/state/opencode-agent/opencode-process.json');
     } finally {
       killSpy.mockRestore();
     }
   });
+
+  it('escalates to SIGKILL when the stale process survives SIGTERM', async () => {
+    // signal-0 always reports alive until SIGKILL lands — the reap must escalate
+    // and still remove the marker after confirming death.
+    let killed = false;
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
+      if (sig === 'SIGKILL') { killed = true; return true; }
+      if (sig === 0) {
+        if (killed) {
+          const err = new Error('ESRCH') as NodeJS.ErrnoException;
+          err.code = 'ESRCH';
+          throw err;
+        }
+        return true; // survives the SIGTERM window
+      }
+      return true; // SIGTERM is a no-op for this process
+    }) as typeof process.kill);
+    fsMocks.existsSync.mockImplementation((path: string) =>
+      path === '/tmp/ctx/state/opencode-agent/opencode-process.json');
+    fsMocks.readFileSync.mockImplementation((path: string) => {
+      if (path === '/tmp/ctx/state/opencode-agent/opencode-process.json') {
+        return JSON.stringify({ pid: 24680 });
+      }
+      return '';
+    });
+
+    try {
+      const pty = new OpencodePTY(mockEnv, {});
+      installSpawnMock(pty);
+      await pty.spawn('fresh', '');
+
+      expect(killSpy).toHaveBeenCalledWith(24680, 'SIGTERM');
+      expect(killSpy).toHaveBeenCalledWith(24680, 'SIGKILL');
+      expect(fsMocks.unlinkSync).toHaveBeenCalledWith('/tmp/ctx/state/opencode-agent/opencode-process.json');
+    } finally {
+      killSpy.mockRestore();
+    }
+  }, 10000);
 
   it('removes the recorded OpenCode process marker on explicit kill', async () => {
     const pty = new OpencodePTY(mockEnv, {});
