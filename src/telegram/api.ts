@@ -5,6 +5,17 @@
 
 import { existsSync, readFileSync } from 'fs';
 import { basename } from 'path';
+import { Agent as HttpsAgent, request as httpsRequest } from 'https';
+
+// A Telegram-only pool, independent from Node fetch/Undici. Affected hosts
+// have a dead IPv6 path to api.telegram.org, so DNS still resolves normally but
+// connections must use IPv4. Reusing sockets also avoids a TLS handshake storm
+// across the fleet's one-second long polls.
+const telegramHttpsAgent = new HttpsAgent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+});
 
 /**
  * Result of TelegramAPI.validateCredentials. Tagged union so callers can
@@ -86,6 +97,22 @@ export class TelegramAPI {
   // Chat IDs already warned for the self_chat trap. Keeps the runtime
   // diagnostic emitted at most once per chat_id per process lifetime.
   private warnedSelfChat: Set<string> = new Set();
+
+  /**
+   * Incident recovery switch for Node/Undici connection-pool failures.
+   *
+   * On affected hosts, global fetch can repeatedly time out while a request
+   * made through node:https in the same process succeeds immediately. Keep
+   * this opt-in so normal installations retain pooled fetch, without changing
+   * bot credentials or polling semantics.
+   *
+   * When enabled this reroutes only the JSON API calls (getUpdates and every
+   * post()-based method) and file downloads (downloadFile) onto node:https.
+   * The multipart uploads sendPhoto/sendDocument still use pooled fetch.
+   */
+  private get useUnpooledHttps(): boolean {
+    return process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS === '1';
+  }
 
   constructor(token: string) {
     this.baseUrl = `https://api.telegram.org/bot${token}`;
@@ -593,6 +620,9 @@ export class TelegramAPI {
    */
   async downloadFile(filePath: string): Promise<Buffer> {
     const url = `https://api.telegram.org/file/bot${this.getToken()}/${filePath}`;
+    if (this.useUnpooledHttps) {
+      return this.requestUnpooledBuffer(url, 30_000);
+    }
     const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
     if (!response.ok) {
       throw new Error(`Failed to download file: ${response.status}`);
@@ -612,6 +642,9 @@ export class TelegramAPI {
    * Make a POST request to the Telegram API.
    */
   private async post(method: string, data: object): Promise<any> {
+    if (this.useUnpooledHttps) {
+      return this.postUnpooled(method, data);
+    }
     try {
       const response = await fetch(`${this.baseUrl}/${method}`, {
         method: 'POST',
@@ -636,6 +669,91 @@ export class TelegramAPI {
       }
       throw new Error(`Telegram API request failed: ${err}`);
     }
+  }
+
+  /** POST JSON over the dedicated keep-alive IPv4 agent, bypassing fetch/Undici. */
+  private postUnpooled(method: string, data: object): Promise<any> {
+    const url = new URL(`${this.baseUrl}/${method}`);
+    const body = Buffer.from(JSON.stringify(data));
+    return new Promise((resolve, reject) => {
+      const req = httpsRequest({
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        agent: telegramHttpsAgent,
+        family: 4,
+        headers: {
+          'content-type': 'application/json',
+          'content-length': String(body.length),
+        },
+      }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.once('end', () => {
+          try {
+            const result = JSON.parse(Buffer.concat(chunks).toString('utf8')) as any;
+            if (!result.ok) {
+              reject(new Error(`Telegram API error: ${result.description || 'Unknown error'}`));
+              return;
+            }
+            resolve(result);
+          } catch (error) {
+            reject(new Error(
+              `Telegram API request failed: invalid JSON response for ${method}`,
+              { cause: error },
+            ));
+          }
+        });
+      });
+      req.setTimeout(15_000, () => {
+        req.destroy(new Error(`Telegram API request timed out after 15s: ${method}`));
+      });
+      req.once('error', error => {
+        // The timeout path destroys the request with the timeout Error above;
+        // pass that through unchanged. Wrap every other transport failure to
+        // match the pooled post() shape.
+        if (error instanceof Error && error.message.startsWith('Telegram API request timed out')) {
+          reject(error);
+          return;
+        }
+        reject(new Error(`Telegram API request failed: ${error}`));
+      });
+      req.end(body);
+    });
+  }
+
+  /** GET a Telegram file over the dedicated keep-alive IPv4 agent, bypassing fetch/Undici. */
+  private requestUnpooledBuffer(rawUrl: string, timeoutMs: number): Promise<Buffer> {
+    const url = new URL(rawUrl);
+    return new Promise((resolve, reject) => {
+      const req = httpsRequest({
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: 'GET',
+        agent: telegramHttpsAgent,
+        family: 4,
+      }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        res.once('end', () => {
+          const status = res.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            reject(new Error(`Failed to download file: ${status}`));
+            return;
+          }
+          resolve(Buffer.concat(chunks));
+        });
+      });
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`Telegram file download timed out after ${Math.round(timeoutMs / 1000)}s`));
+      });
+      req.once('error', error => reject(error));
+      req.end();
+    });
   }
 
   /**

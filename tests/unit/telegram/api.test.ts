@@ -1,4 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// Mock node:https so the unpooled transport can be driven without real sockets.
+// The Agent stub must be constructable — the module does `new HttpsAgent(...)`
+// at import time.
+vi.mock('https', () => ({ Agent: class {}, request: vi.fn() }));
+
+import { request as httpsRequest } from 'https';
 import { TelegramAPI, formatValidateError } from '../../../src/telegram/api';
 
 // ---------------------------------------------------------------------------
@@ -321,5 +328,170 @@ describe('formatValidateError', () => {
       detail: 'Too Many Requests: retry after 5',
     });
     expect(msg).toMatch(/retry/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unpooled HTTPS transport (CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS)
+// ---------------------------------------------------------------------------
+describe('TelegramAPI unpooled HTTPS', () => {
+  const mockedRequest = vi.mocked(httpsRequest);
+  const originalUnpooledSetting = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+
+  // Build a fake req/res pair. The response is driven synchronously when the
+  // source calls req.end(), by which point its data/end handlers are registered.
+  function driveHttps(opts: { statusCode: number; chunks: Buffer[] }) {
+    const res: any = {
+      statusCode: opts.statusCode,
+      _handlers: {} as Record<string, (arg?: any) => void>,
+      on(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+      once(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+    };
+    const req: any = {
+      setTimeout: vi.fn().mockReturnThis(),
+      once: vi.fn().mockReturnThis(),
+      on: vi.fn().mockReturnThis(),
+      destroy: vi.fn(),
+      end: vi.fn(function () {
+        for (const chunk of opts.chunks) res._handlers['data']?.(chunk);
+        res._handlers['end']?.();
+      }),
+    };
+    mockedRequest.mockImplementation(((_options: any, cb: any) => {
+      cb(res);
+      return req;
+    }) as any);
+    return { req, res };
+  }
+
+  beforeEach(() => {
+    mockedRequest.mockReset();
+  });
+
+  afterEach(() => {
+    if (originalUnpooledSetting === undefined) {
+      delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    } else {
+      process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooledSetting;
+    }
+    vi.restoreAllMocks();
+  });
+
+  // POSITIVE CONTROL: must fail if the unpooled branch in post() is missing.
+  it('T1: routes getUpdates through node:https with family 4 when flag is 1', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    driveHttps({
+      statusCode: 200,
+      chunks: [Buffer.from(JSON.stringify({ ok: true, result: [] }))],
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const api = new TelegramAPI('123:TEST');
+    const res = await api.getUpdates(0, 1);
+
+    expect(res.ok).toBe(true);
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const options = mockedRequest.mock.calls[0][0] as any;
+    expect(options.family).toBe(4);
+    expect(options.method).toBe('POST');
+    expect(options.hostname).toBe('api.telegram.org');
+    expect(options.path).toContain('/getUpdates');
+    expect(options.agent).toBeTruthy();
+  });
+
+  it('T2: uses fetch (not node:https) when flag is unset or 0', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({ ok: true, result: [] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+    await new TelegramAPI('123:TEST').getUpdates(0, 1);
+
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
+    await new TelegramAPI('123:TEST').getUpdates(0, 1);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(mockedRequest).not.toHaveBeenCalled();
+  });
+
+  it('T3: downloadFile returns the response bytes over a node:https GET', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    const payload = [Buffer.from([0x89, 0x50]), Buffer.from([0x4e, 0x47])];
+    driveHttps({ statusCode: 200, chunks: payload });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const api = new TelegramAPI('123:TEST');
+    const buf = await api.downloadFile('photos/file_1.jpg');
+
+    expect(Buffer.isBuffer(buf)).toBe(true);
+    expect(buf.equals(Buffer.concat(payload))).toBe(true);
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const options = mockedRequest.mock.calls[0][0] as any;
+    expect(options.method).toBe('GET');
+    expect(options.family).toBe(4);
+  });
+
+  it('T4a: post rejects with a Telegram API error when ok is false, over node:https', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    driveHttps({
+      statusCode: 200,
+      chunks: [Buffer.from(JSON.stringify({ ok: false, description: 'Bad Request' }))],
+    });
+    // Mock fetch so no real network call happens if the unpooled routing is
+    // removed, and so the routing assertions below go RED in that case.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify({ ok: false, description: 'FETCH PATH' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.getUpdates(0, 1)).rejects.toThrow(/^Telegram API error/);
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('T4b: downloadFile rejects with the status on a non-2xx response, over node:https', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    driveHttps({ statusCode: 404, chunks: [] });
+    // Mock fetch to a DIFFERENT status so no real network call happens and the
+    // rejection message (404) is wrong if routing falls through to fetch.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response('nope', { status: 500 }),
+    );
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.downloadFile('photos/missing.jpg')).rejects.toThrow(
+      'Failed to download file: 404',
+    );
+    expect(mockedRequest).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('T4c: post wraps a non-timeout transport error to match the pooled shape', async () => {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '1';
+    // Fire the req "error" handler with a raw transport error (e.g. ECONNRESET).
+    mockedRequest.mockImplementation(((_options: any, _cb: any) => {
+      const req: any = {
+        setTimeout: vi.fn().mockReturnThis(),
+        on: vi.fn().mockReturnThis(),
+        destroy: vi.fn(),
+        end: vi.fn(),
+        once(event: string, h: (arg?: any) => void) {
+          if (event === 'error') h(new Error('ECONNRESET'));
+          return this;
+        },
+      };
+      return req;
+    }) as any);
+
+    const api = new TelegramAPI('123:TEST');
+    await expect(api.getUpdates(0, 1)).rejects.toThrow(/^Telegram API request failed:/);
   });
 });

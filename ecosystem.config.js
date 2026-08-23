@@ -24,6 +24,12 @@ module.exports = {
         CTX_FRAMEWORK_ROOT: FRAMEWORK_ROOT,
         CTX_PROJECT_ROOT: PROJECT_ROOT,
         CTX_ORG: CTX_ORG,
+        // Node's shared fetch/Undici pool can wedge on hosts with a dead IPv6
+        // path to api.telegram.org; set to '1' to route Telegram JSON API calls
+        // and file downloads over a dedicated keep-alive IPv4 node:https path
+        // (multipart photo/document uploads stay on pooled fetch). Leave '0' by
+        // default.
+        CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS: process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS || '0',
         // Debug-only: set to '1' to enable SIGUSR2 signal → controlled
         // uncaughtException for testing the crash-visibility path
         // (.daemon-crashed markers + crash-loop operator Telegram alert).
