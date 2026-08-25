@@ -7,10 +7,11 @@ import { existsSync, readFileSync } from 'fs';
 import { basename } from 'path';
 import { Agent as HttpsAgent, request as httpsRequest } from 'https';
 
-// A Telegram-only pool, independent from Node fetch/Undici. Affected hosts
-// have a dead IPv6 path to api.telegram.org, so DNS still resolves normally but
-// connections must use IPv4. Reusing sockets also avoids a TLS handshake storm
-// across the fleet's one-second long polls.
+// A Telegram-only pool, independent from Node fetch/Undici. Affected hosts have
+// a dead IPv6 path to api.telegram.org, so each request uses Happy Eyeballs
+// (autoSelectFamily) to race the families and self-heal onto the reachable one
+// — no hard IPv4 pin, so genuinely IPv6-only hosts still work. Reusing sockets
+// also avoids a TLS handshake storm across the fleet's one-second long polls.
 const telegramHttpsAgent = new HttpsAgent({
   keepAlive: true,
   maxSockets: 64,
@@ -99,19 +100,45 @@ export class TelegramAPI {
   private warnedSelfChat: Set<string> = new Set();
 
   /**
-   * Incident recovery switch for Node/Undici connection-pool failures.
+   * Resilient Telegram transport switch. On by default.
    *
-   * On affected hosts, global fetch can repeatedly time out while a request
-   * made through node:https in the same process succeeds immediately. Keep
-   * this opt-in so normal installations retain pooled fetch, without changing
-   * bot credentials or polling semantics.
+   * global fetch is backed by Undici, which hardcodes autoSelectFamily=false
+   * and so gets no Happy Eyeballs (RFC 8305) on any Node version. On a
+   * broken-dual-stack host (IPv6 configured but blackholed) it commits to the
+   * dead family and wedges for the full timeout, and because the poller
+   * serializes, every subsequent Telegram call queues behind it. Routing the
+   * JSON API through node:https instead gives us autoSelectFamily (Happy
+   * Eyeballs), which races the families and self-heals — without breaking
+   * genuinely IPv6-only hosts the way an IPv4 pin would.
    *
-   * When enabled this reroutes only the JSON API calls (getUpdates and every
-   * post()-based method) and file downloads (downloadFile) onto node:https.
-   * The multipart uploads sendPhoto/sendDocument still use pooled fetch.
+   * This reroutes only the JSON API calls (getUpdates and every post()-based
+   * method) and file downloads (downloadFile) onto node:https. The multipart
+   * uploads sendPhoto/sendDocument still use pooled fetch.
+   *
+   * Set CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS=0 to opt out and force pooled fetch.
    */
   private get useUnpooledHttps(): boolean {
-    return process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS === '1';
+    return process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS !== '0';
+  }
+
+  /**
+   * Per-family connection-attempt timeout for Happy Eyeballs, in ms. 250ms is
+   * Node's own default; on a high-latency client (satellite/cellular) it can
+   * false-timeout the first family before it would have connected, so make it
+   * env-tunable via CORTEXTOS_TELEGRAM_HAPPY_EYEBALLS_TIMEOUT_MS.
+   */
+  private get happyEyeballsAttemptTimeoutMs(): number {
+    const raw = Number(process.env.CORTEXTOS_TELEGRAM_HAPPY_EYEBALLS_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 250;
+  }
+
+  /**
+   * Shared node:https connect options for the resilient transport. Bound once
+   * so postUnpooled and requestUnpooledBuffer cannot diverge on the family
+   * behavior — Happy Eyeballs (autoSelectFamily) instead of any hard pin.
+   */
+  private get unpooledConnectOptions(): { autoSelectFamily: true; autoSelectFamilyAttemptTimeout: number } {
+    return { autoSelectFamily: true, autoSelectFamilyAttemptTimeout: this.happyEyeballsAttemptTimeoutMs };
   }
 
   constructor(token: string) {
@@ -671,7 +698,7 @@ export class TelegramAPI {
     }
   }
 
-  /** POST JSON over the dedicated keep-alive IPv4 agent, bypassing fetch/Undici. */
+  /** POST JSON over the dedicated keep-alive agent (Happy Eyeballs), bypassing fetch/Undici. */
   private postUnpooled(method: string, data: object): Promise<any> {
     const url = new URL(`${this.baseUrl}/${method}`);
     const body = Buffer.from(JSON.stringify(data));
@@ -683,7 +710,7 @@ export class TelegramAPI {
         path: `${url.pathname}${url.search}`,
         method: 'POST',
         agent: telegramHttpsAgent,
-        family: 4,
+        ...this.unpooledConnectOptions,
         headers: {
           'content-type': 'application/json',
           'content-length': String(body.length),
@@ -724,7 +751,7 @@ export class TelegramAPI {
     });
   }
 
-  /** GET a Telegram file over the dedicated keep-alive IPv4 agent, bypassing fetch/Undici. */
+  /** GET a Telegram file over the dedicated keep-alive agent (Happy Eyeballs), bypassing fetch/Undici. */
   private requestUnpooledBuffer(rawUrl: string, timeoutMs: number): Promise<Buffer> {
     const url = new URL(rawUrl);
     return new Promise((resolve, reject) => {
@@ -735,7 +762,7 @@ export class TelegramAPI {
         path: `${url.pathname}${url.search}`,
         method: 'GET',
         agent: telegramHttpsAgent,
-        family: 4,
+        ...this.unpooledConnectOptions,
       }, res => {
         const chunks: Buffer[] = [];
         res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));

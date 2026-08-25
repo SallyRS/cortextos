@@ -19,11 +19,24 @@ const { logOutboundMessage, logInboundMessage, cacheLastSent, readLastSent } = r
 
 const mock = new MockTelegramServer(39182);
 
+// createApi() overrides baseUrl to the local HTTP mock server. The default
+// node:https transport (postUnpooled) would issue https.request against that
+// http:// URL and fail, so force the pooled fetch path this mock-server suite
+// was written for. Same env guard the unit tests use for their fetch-path
+// blocks (see tests/unit/telegram/api.test.ts).
+const originalUnpooledSetting = process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+
 test.beforeAll(async () => {
+  process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = '0';
   await mock.start();
 });
 
 test.afterAll(async () => {
+  if (originalUnpooledSetting === undefined) {
+    delete process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS;
+  } else {
+    process.env.CORTEXTOS_TELEGRAM_UNPOOLED_HTTPS = originalUnpooledSetting;
+  }
   await mock.stop();
 });
 

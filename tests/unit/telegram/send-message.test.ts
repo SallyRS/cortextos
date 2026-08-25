@@ -1,9 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// Mock node:https so the DEFAULT (on) unpooled transport is driven without real
+// sockets. Without this, sendMessage -> post() -> postUnpooled() would make a
+// LIVE call to api.telegram.org. The Agent stub must be constructable — the
+// module does `new HttpsAgent(...)` at import time. Mirrors the mock in
+// tests/unit/telegram/api.test.ts so these tests exercise the real default path.
+vi.mock('https', () => ({ Agent: class {}, request: vi.fn() }));
+
+import { request as httpsRequest } from 'https';
 import { TelegramAPI } from '../../../src/telegram/api';
 
-// Shared fetch-stub infrastructure. Each test queues responses; the stub
-// records call details so we can assert on payload shapes and call counts.
+// Shared node:https-stub infrastructure. Each test queues responses; the stub
+// records call details (url + parsed JSON body) so we can assert on payload
+// shapes and call counts exactly as the previous fetch stub did.
 type MockResponse = { status: number; body: any } | { throws: Error };
+
+const mockedRequest = vi.mocked(httpsRequest);
 
 let responseQueue: MockResponse[] = [];
 let callLog: Array<{ url: string; body: any }> = [];
@@ -23,29 +35,50 @@ beforeEach(() => {
     warnLog.push(args.map((a) => String(a)).join(' '));
   };
 
-  vi.stubGlobal(
-    'fetch',
-    vi.fn(async (url: string, init: RequestInit) => {
-      const body = init?.body ? JSON.parse(String(init.body)) : {};
-      callLog.push({ url, body });
-      const next = responseQueue.shift();
-      if (!next) {
-        throw new Error('fetch called with no queued response');
-      }
-      if ('throws' in next) {
-        throw next.throws;
-      }
-      return {
-        ok: next.status === 200,
-        status: next.status,
-        json: async () => next.body,
-      } as any;
-    }),
-  );
+  // Drive the real default node:https transport (postUnpooled). Each request's
+  // response is produced synchronously when the source calls req.end(body), by
+  // which point postUnpooled has registered the res data/end handlers.
+  mockedRequest.mockReset();
+  mockedRequest.mockImplementation(((options: any, cb: any) => {
+    const res: any = {
+      statusCode: 200,
+      _handlers: {} as Record<string, (arg?: any) => void>,
+      on(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+      once(event: string, h: (arg?: any) => void) { this._handlers[event] = h; return this; },
+    };
+    cb(res);
+    const req: any = {
+      setTimeout: vi.fn().mockReturnThis(),
+      on: vi.fn().mockReturnThis(),
+      destroy: vi.fn(),
+      _errHandler: undefined as ((err: Error) => void) | undefined,
+      once(event: string, h: (arg?: any) => void) {
+        if (event === 'error') this._errHandler = h;
+        return this;
+      },
+      end(body?: Buffer) {
+        const parsed = body ? JSON.parse(body.toString('utf8')) : {};
+        callLog.push({ url: `https://${options.hostname}${options.path}`, body: parsed });
+        const next = responseQueue.shift();
+        if (!next) {
+          this._errHandler?.(new Error('https.request called with no queued response'));
+          return;
+        }
+        if ('throws' in next) {
+          this._errHandler?.(next.throws);
+          return;
+        }
+        res.statusCode = next.status;
+        res._handlers['data']?.(Buffer.from(JSON.stringify(next.body)));
+        res._handlers['end']?.();
+      },
+    };
+    return req;
+  }) as any);
 });
 
 afterEach(() => {
-  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   console.warn = originalWarn;
 });
 
